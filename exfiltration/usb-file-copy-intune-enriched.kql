@@ -1,0 +1,141 @@
+// =============================================================================
+// FILES COPIED TO USB DRIVES — Enhanced with Intune Device Control Identifiers
+// =============================================================================
+// Detects files written to USB-mounted removable drives and enriches alerts
+// with VID_PID, InstancePathId, and SerialNumberId from fleet-wide PnP events
+// so analysts can cross-reference Intune's approved device exclusion list.
+//
+// DATA SOURCES: DeviceEvents (UsbDriveMounted, PnpDeviceConnected),
+//               DeviceFileEvents (FileCreated)
+// PLATFORM:     Microsoft Sentinel (TimeGenerated). For Defender XDR Advanced
+//               Hunting, replace TimeGenerated with Timestamp.
+// MITRE:        TA0010 → T1052.001 (Exfiltration Over USB)
+// AUTHOR:       Nicholas Isakson
+// =============================================================================
+// TUNABLE THRESHOLDS
+let PnpLookbackDays = 30d;  // Fleet-wide PnP scan window — reduce to 14d if performance degrades
+let DetectionWindow = 2h;    // Must match Rule Period in analytics rule config
+// Step 1: USB mount events
+let UsbDriveMount = DeviceEvents
+    | where TimeGenerated >= ago(DetectionWindow)
+    | where ActionType == "UsbDriveMounted"
+    | extend ParsedFields = parse_json(AdditionalFields)
+    | project
+        DeviceId,
+        DeviceName,
+        DriveLetter = tostring(ParsedFields.DriveLetter),
+        MountTime = TimeGenerated,
+        ProductName = trim_end(@'\s+', trim_start(@'\s+', tostring(ParsedFields.ProductName))),
+        SerialNumber = trim_end(@'\s+', trim_start(@'\s+', tostring(ParsedFields.SerialNumber))),
+        Manufacturer = trim_end(@'\s+', trim_start(@'\s+', tostring(ParsedFields.Manufacturer)));
+// Step 2: File creation on removable drives
+let FileCreation = DeviceFileEvents
+    | where TimeGenerated >= ago(DetectionWindow)
+    | where InitiatingProcessAccountName != "system"
+    | where ActionType == "FileCreated"
+    | where FolderPath !startswith "C:\\" and FolderPath !startswith "\\\\"
+    | project
+        ReportId,
+        DeviceId,
+        InitiatingProcessAccountDomain,
+        InitiatingProcessAccountName,
+        InitiatingProcessAccountUpn,
+        FileName,
+        FolderPath,
+        SHA256,
+        TimeGenerated,
+        SensitivityLabel,
+        IsAzureInfoProtectionApplied;
+// Step 3: Core detection — file written to USB-mounted drive
+let UsbFileCopies = FileCreation
+    | lookup kind=inner (UsbDriveMount) on DeviceId
+    | where FolderPath startswith DriveLetter
+    | where TimeGenerated >= MountTime
+    | partition hint.strategy=native by ReportId (top 1 by MountTime);
+// Step 4: DiskDrive PnP — bridge between ProductName and USB serial (fleet-wide)
+// USBSTOR path encodes ProductName between Prod_ and &Rev_, serial in last segment
+let DiskDrivePnp = DeviceEvents
+    | where TimeGenerated >= ago(PnpLookbackDays)
+    | where ActionType == "PnpDeviceConnected"
+    | extend Pnp = parse_json(AdditionalFields)
+    | where tostring(Pnp.ClassName) == "DiskDrive"
+    | extend DiskInstancePath = tostring(Pnp.DeviceId)
+    | where DiskInstancePath startswith "USBSTOR\\"
+    | extend
+        DiskProductName = trim_end(
+                      @'\s+',
+                      trim_start(
+                          @'\s+',
+                          replace_string(
+                              extract(@"Prod_(.+?)&Rev_", 1, DiskInstancePath),
+                              "_",
+                              " "
+                          )
+                      )
+                  ),
+        DiskSerial = extract(@"USBSTOR\\[^\\]+\\([^&]+)", 1, DiskInstancePath)
+    | where isnotempty(DiskProductName) and isnotempty(DiskSerial)
+    | summarize
+        DiskProductName = take_any(DiskProductName),
+        DiskPnpLastSeen = max(TimeGenerated),
+        DiskSeenOnMachines = make_set(DeviceName, 10)
+        by DiskSerial;
+// Step 5: USB-class PnP — VID_PID source, joined to DiskDrive via shared serial
+let UsbClassPnp = DeviceEvents
+    | where TimeGenerated >= ago(PnpLookbackDays)
+    | where ActionType == "PnpDeviceConnected"
+    | extend Pnp = parse_json(AdditionalFields)
+    | where tostring(Pnp.ClassName) == "USB"
+    | extend UsbInstancePathId = tostring(Pnp.DeviceId)
+    | where UsbInstancePathId startswith "USB\\VID_"
+    | extend
+        UsbVID_PID = extract(@"USB\\(VID_[0-9A-Fa-f]+&PID_[0-9A-Fa-f]+)", 1, UsbInstancePathId),
+        UsbSerial = extract(@"USB\\VID_[0-9A-Fa-f]+&PID_[0-9A-Fa-f]+\\(.+)$", 1, UsbInstancePathId)
+    | where isnotempty(UsbVID_PID) and isnotempty(UsbSerial) and UsbSerial !has "&"
+    | summarize
+        UsbInstancePathId = take_any(UsbInstancePathId),
+        UsbVID_PID = take_any(UsbVID_PID)
+        by UsbSerial;
+// Step 6: Build device reference — DiskDrive + USB joined by serial
+let DeviceReference = DiskDrivePnp
+    | join kind=inner (UsbClassPnp) on $left.DiskSerial == $right.UsbSerial
+    | project
+        DiskProductName,
+        IntuneInstancePathId = UsbInstancePathId,   // → Intune: InstancePathId
+        IntuneVID_PID = UsbVID_PID,                 // → Intune: VID_PID
+        IntuneSerialNumberId = DiskSerial,           // → Intune: SerialNumberId
+        DiskSeenOnMachines,
+        DiskPnpLastSeen;
+// Step 7: Enrich detections and output
+UsbFileCopies
+| join kind=leftouter (DeviceReference) on $left.ProductName == $right.DiskProductName
+| extend HostName = iff(DeviceName has '.', substring(DeviceName, 0, indexof(DeviceName, '.')), DeviceName)
+| extend DnsDomain = iff(DeviceName has '.', substring(DeviceName, indexof(DeviceName, '.') + 1), "")
+| extend FileHashAlgorithm = 'SHA256'
+| project
+    TimeGenerated,
+    DeviceName,
+    HostName,
+    DnsDomain,
+    InitiatingProcessAccountDomain,
+    InitiatingProcessAccountName,
+    InitiatingProcessAccountUpn,
+    FileName,
+    FolderPath,
+    SHA256,
+    FileHashAlgorithm,
+    DriveLetter,
+    MountTime,
+    ProductName,
+    SerialNumber,
+    Manufacturer,
+    IntuneVID_PID,
+    IntuneInstancePathId,
+    IntuneSerialNumberId,
+    DiskSeenOnMachines,
+    DiskPnpLastSeen,
+    SensitivityLabel,
+    IsAzureInfoProtectionApplied,
+    ReportId,
+    DeviceId
+| order by DeviceId asc, TimeGenerated desc

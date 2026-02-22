@@ -1,0 +1,54 @@
+// Rule Title: Logon Detected on Stolen or Missing Device
+// Author: Nicholas I.
+// Date: 2026-01-20
+// Description: This detection identifies successful logon activity (Event ID 4624) on a device that has been reported as stolen or missing.
+//              Such activity is highly suspicious and could indicate unauthorized access. The rule enriches the alert with ISP IP information
+//              from Azure AD sign-in logs to aid in investigation.
+// Severity: High
+// Tactic: Initial Access
+// Technique: T1078
+//
+// Prerequisites:
+// This rule requires a function named 'MissingOrStolenDevices' to be created and maintained.
+// The function should return a dynamic list of stolen/missing device hostnames (without the '$' suffix).
+// Example function body:
+// dynamic([
+// "STOLEN-DEVICE-01",
+// "MISSING-LAPTOP-02"
+// ])
+//
+// False Positive Tuning:
+// The accuracy of this rule is entirely dependent on the 'MissingOrStolenDevices' list being kept up-to-date.
+// Ensure devices are removed from the list once they are recovered or decommissioned to prevent false positives.
+
+// Prepare AAD logs to look up ISP IP addresses for enrichment.
+let AADLogs = AADNonInteractiveUserSignInLogs
+| where TimeGenerated > ago(36h)
+// The ISP IP is often found in the 3rd element of the AuthenticationProcessingDetails JSON array.
+// This may need adjustment if the log schema changes.
+| extend DeviceName = tostring(parse_json(DeviceDetail).displayName)
+| extend IspIp = tostring(parse_json(AuthenticationProcessingDetails)[3].value)
+// Filter out non-IP values that can sometimes appear in the log field.
+| where isnotempty(IspIp) and IspIp !in ("True", "False")
+| summarize IspIpSet = make_set(IspIp) by DeviceName;
+// Main query to find logon events on specified devices.
+SecurityEvent
+| where TimeGenerated > ago(36h)
+| where EventID == 4624 // Corresponds to "An account was successfully logged on."
+// Filter for logons on devices listed in the function. TargetUserName holds the machine account name (e.g., "DEVICENAME$").
+// The 'has_any' operator will match the device name part.
+| where TargetUserName has_any (MissingOrStolenDevices())
+| where isnotempty(IpAddress) and IpAddress != "-"
+// Clean the machine account name from the 'Account' field (e.g., "DOMAIN\DEVICENAME$") to get a clean hostname for joining.
+| extend CleanDeviceName = replace_string(tostring(split(Account, '\\')[1]), '$', '')
+// Join with AAD logs to enrich with ISP IP information.
+| join kind=leftouter (AADLogs) on $left.CleanDeviceName == $right.DeviceName
+// Summarize all activity for a single device into one alert.
+| summarize StartTime = min(TimeGenerated),
+            EndTime = max(TimeGenerated),
+            EventCount = count(),
+            InternalIPs = make_set(IpAddress),
+            // Collect all unique ISP IPs observed from AAD logs.
+            ObservedIspIPs = make_set(IspIpSet)
+            by DeviceName = CleanDeviceName
+| project StartTime, EndTime, DeviceName, EventCount, InternalIPs, ObservedIspIPs

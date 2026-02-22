@@ -1,0 +1,468 @@
+// =================================================================================
+// ML-Based Privileged Account Anomaly Detection - Community Edition
+// =================================================================================
+// 
+// AUTHOR:      Nicholas Isakson
+// CREATED:     2025-01-22
+// VERSION:     2.1 (Community Edition - Self-Calibrating)
+// 
+// DESCRIPTION:
+//   Multi-layered detection rule for identifying anomalous behavior on privileged
+//   accounts in Microsoft Defender for Identity / Entra ID environments. Combines
+//   statistical anomaly detection, absolute rules, ratio-based thresholds, and
+//   behavioral shift analysis to surface compromised privileged accounts.
+//
+// DETECTION METHODOLOGY:
+//   1. series_decompose_anomalies() - Statistical deviation detection
+//   2. Absolute rules - Actions that should NEVER occur for service accounts
+//   3. Ratio-based detection - Actions with abnormal frequency ratios
+//   4. Behavioral shift detection - Technique substitution patterns
+//   5. Reconnaissance anomaly detection - LDAP/directory query bursts
+//   6. MFA gap detection - Privileged accounts authenticating without MFA
+//
+// ORIGINAL DERIVATION:
+//   Detection thresholds were originally derived from diffpatterns() analysis
+//   comparing penetration test activity against normal operational baselines.
+//   This community edition replaces hardcoded thresholds with self-calibrating
+//   statistical methods wherever possible.
+//
+// DATA SOURCES:
+//   - IdentityDirectoryEvents (Microsoft Defender for Identity)
+//   - IdentityQueryEvents (Microsoft Defender for Identity)
+//   - SigninLogs (Entra ID / Azure AD)
+//   - IdentityInfo (Microsoft Defender for Identity)
+//
+// MITRE ATT&CK MAPPING:
+//   - T1078   Valid Accounts (Privileged account abuse)
+//   - T1098   Account Manipulation (Group/mail attribute changes)
+//   - T1087   Account Discovery (Reconnaissance anomalies)
+//   - T1069   Permission Groups Discovery (Reconnaissance anomalies)
+//   - T1047   Windows Management Instrumentation (Behavioral shift)
+//   - T1531   Account Access Removal (Account deletion)
+//   - T1556   Modify Authentication Process (MFA gap detection)
+//
+// TUNING GUIDE:
+//   This rule is designed to self-calibrate from your environment's baseline data.
+//   However, the following parameters may require tuning:
+//
+//   GENERAL:
+//   - BaselineDays / DetectionDays: Adjust observation windows to your needs.
+//     Longer baselines = more stable statistics but slower to adapt.
+//   - AnomalyThreshold: Standard deviations for series_decompose_anomalies().
+//     Lower = more sensitive (more alerts), Higher = fewer alerts.
+//     Recommended: 1.5 (sensitive), 2.0 (balanced), 2.5 (conservative).
+//
+//   NEVER ACTIONS (Layer 1):
+//   - NeverActions list: Review for your environment. Actions listed here are
+//     treated as ABSOLUTE red flags on privileged/service accounts. If your org
+//     has legitimate automation that changes group memberships or mail attributes
+//     on privileged accounts, REMOVE those actions from this list or you will
+//     get false positives. Consider adding actions specific to your environment
+//     that should never occur on privileged accounts.
+//
+//   HIGH RATIO ACTIONS (Layer 2):
+//   - HighRatioActions list: Actions with historically high attack correlation.
+//     The threshold is SELF-CALIBRATING: it flags when the detection window's
+//     daily average exceeds the baseline daily average by the configured
+//     multiplier (HighRatioMultiplier). Adjust the multiplier if needed.
+//
+//   BEHAVIORAL SHIFT (Layer 3):
+//   - MonitoredTechnique: Defaults to "WMI execution". Change this to any
+//     ActionType that is commonly used in your environment for legitimate
+//     management but could also indicate lateral movement. Examples:
+//     "PowerShell execution", "SMB file copy", "Service creation".
+//   - ShiftDropPercent: How much the technique must drop (as a percentage of
+//     baseline) to be considered a "shift". Default 50% (drops to half).
+//   - ShiftMinOtherActions: Minimum other high-risk actions that must continue
+//     while the monitored technique drops. Prevents false positives from
+//     accounts that simply went quiet entirely.
+//
+//   SCORING (Step 9):
+//   - All scoring multipliers can be adjusted. The defaults provide a balanced
+//     starting point. If a specific layer is too noisy in your environment,
+//     reduce its multiplier. If a layer catches real incidents, increase it.
+//
+// =================================================================================
+// CONFIGURATION - TUNE THESE FOR YOUR ENVIRONMENT
+// =================================================================================
+// --- Time Windows ---
+let BaselineDays = 60;                   // Days of history for baseline (minimum 30 recommended)
+let DetectionDays = 7;                   // Days to evaluate for anomalies
+let BufferDays = 7;                      // Gap between baseline and detection to avoid data bleed
+let BaselineStart = ago(BaselineDays + BufferDays + DetectionDays);
+let BaselineEnd = ago(BufferDays + DetectionDays);
+let DetectionStart = ago(DetectionDays);
+let DetectionEnd = now();
+// --- Anomaly Detection ---
+let AnomalyThreshold = 2.0;             // Std deviations for series_decompose_anomalies (1.5=sensitive, 2.0=balanced, 2.5=conservative)
+let HighRatioMultiplier = 5.0;          // Flag when detection daily avg exceeds baseline daily avg by this factor
+let ShiftDropPercent = 50.0;            // Technique must drop by this % to count as a behavioral shift
+let ShiftMinOtherActions = 10;          // Minimum other high-risk actions continuing during a shift
+// --- Privileged Roles ---
+// Add or remove roles based on your organization's Entra ID role assignments.
+// These should represent roles with elevated access that warrant monitoring.
+let PrivilegedRoles = dynamic([
+    "Global Administrator",
+    "Privileged Role Administrator",
+    "Security Administrator",
+    "Exchange Administrator",
+    "SharePoint Administrator",
+    "User Administrator",
+    "Application Administrator",
+    "Cloud Application Administrator",
+    "Authentication Administrator",
+    "Privileged Authentication Administrator",
+    "Conditional Access Administrator",
+    "Intune Administrator"
+]);
+// --- Privileged Account Naming Conventions ---
+// Adjust these patterns to match your organization's naming standards.
+// These catch privileged/service accounts that may not have explicit role assignments.
+let PrivilegedNamePatterns = dynamic([
+    "admin",
+    "adm",
+    "_svc",
+    "-svc"
+]);
+// --- Action Classifications ---
+// NEVER ACTIONS: These should NEVER occur on service/privileged accounts.
+// IMPORTANT: Review this list against your environment's automation workflows.
+// If you have legitimate identity governance tools (e.g., Entra Lifecycle Workflows,
+// SailPoint, Saviynt) that modify group memberships or mail attributes on
+// privileged accounts, REMOVE those actions from this list to avoid false positives.
+let NeverActions = dynamic([
+    "Group Membership changed",
+    "User Mail changed"
+]);
+// HIGH RATIO ACTIONS: Actions with historically high correlation to attack activity.
+// The detection threshold is dynamically calculated from your baseline data.
+let HighRatioActions = dynamic([
+    "Account Deleted changed"
+]);
+// HIGH-RISK ACTIONS: All actions considered high-risk for monitoring.
+// Used for time-series anomaly detection and behavioral shift analysis.
+let HighRiskActions = dynamic([
+    "PowerShell execution",
+    "Service creation",
+    "SMB file copy",
+    "WMI execution",
+    "Group Membership changed",
+    "Account Deleted changed",
+    "Account disabled",
+    "Account Path changed",
+    "User Mail changed"
+]);
+// MONITORED TECHNIQUE: The technique to watch for behavioral shifts.
+// When this technique drops significantly while other high-risk actions continue,
+// it may indicate an attacker pivoting to alternative methods.
+let MonitoredTechnique = "WMI execution";
+// --- Scoring Weights ---
+// Adjust these multipliers to tune alert prioritization for your environment.
+// Higher values = that detection layer contributes more to the composite score.
+let Weight_NeverAction = 100.0;          // Score when a "never action" fires (absolute red flag)
+let Weight_HighRatio = 20.0;             // Multiplied by daily average of high-ratio actions
+let Weight_BehavioralShift = 50.0;       // Score when behavioral shift is detected
+let Weight_MLAnomaly = 10.0;             // Multiplied by ML anomaly score
+let Weight_ReconAnomaly = 5.0;           // Multiplied by recon anomaly score
+let Weight_MFAGap = 0.5;                // Multiplied by MFA gap percentage
+// =================================================================================
+// STEP 1: Identify Privileged Accounts
+// =================================================================================
+let PrivilegedFromRoles = IdentityInfo
+    | where TimeGenerated > ago(90d)
+    | where AssignedRoles has_any (PrivilegedRoles)
+    | summarize Roles = make_set(AssignedRoles), arg_max(TimeGenerated, *) by AccountUPN
+    | project AccountUPN, Roles, DetectionSource = "Role-Based";
+let PrivilegedFromNaming = IdentityInfo
+    | where TimeGenerated > ago(90d)
+    | where AccountUPN has_any (PrivilegedNamePatterns)
+    | summarize arg_max(TimeGenerated, *) by AccountUPN
+    | where AccountUPN !in~ ((PrivilegedFromRoles | project AccountUPN))
+    | project AccountUPN, Roles = dynamic(["Naming Convention"]), DetectionSource = "Naming-Based";
+let AllPrivilegedUsers = union PrivilegedFromRoles, PrivilegedFromNaming
+    | summarize Roles = make_set(Roles), DetectionSource = make_set(DetectionSource) by AccountUPN
+    | extend AccountName = tolower(tostring(split(AccountUPN, "@")[0]));
+// =================================================================================
+// STEP 2: DETECTION LAYER 1 - "Never Actions" (Absolute Rules)
+// =================================================================================
+// Actions that should NEVER occur on privileged/service accounts.
+// Any occurrence is an immediate red flag regardless of volume.
+let NeverActionAlerts = IdentityDirectoryEvents
+    | where TimeGenerated between (DetectionStart .. DetectionEnd)
+    | where AccountUpn in~ ((AllPrivilegedUsers | project AccountUPN))
+    | where ActionType in (NeverActions)
+    | summarize 
+        NeverAction_Count = count(),
+        NeverAction_Types = make_set(ActionType),
+        NeverAction_Targets = make_set(TargetAccountUpn),
+        NeverAction_FirstSeen = min(TimeGenerated),
+        NeverAction_LastSeen = max(TimeGenerated)
+        by AccountUpn;
+// =================================================================================
+// STEP 3: DETECTION LAYER 2 - High Ratio Actions (Self-Calibrating Threshold)
+// =================================================================================
+// Calculates each account's baseline daily average for high-ratio actions,
+// then flags when the detection window exceeds it by HighRatioMultiplier.
+let HighRatioBaseline = IdentityDirectoryEvents
+    | where TimeGenerated between (BaselineStart .. BaselineEnd)
+    | where AccountUpn in~ ((AllPrivilegedUsers | project AccountUPN))
+    | where ActionType in (HighRatioActions)
+    | summarize 
+        Baseline_HighRatio_Total = count()
+        by AccountUpn
+    | extend Baseline_HighRatio_DailyAvg = Baseline_HighRatio_Total / todouble(BaselineDays);
+let HighRatioRecent = IdentityDirectoryEvents
+    | where TimeGenerated between (DetectionStart .. DetectionEnd)
+    | where AccountUpn in~ ((AllPrivilegedUsers | project AccountUPN))
+    | where ActionType in (HighRatioActions)
+    | summarize 
+        HighRatio_Count = count(),
+        HighRatio_Types = make_set(ActionType)
+        by AccountUpn
+    | extend HighRatio_DailyAvg = HighRatio_Count / todouble(DetectionDays);
+let HighRatioAlerts = HighRatioRecent
+    | join kind=leftouter (HighRatioBaseline) on AccountUpn
+    | extend Baseline_HighRatio_DailyAvg = coalesce(Baseline_HighRatio_DailyAvg, 0.0)
+    | where 
+        // If baseline is zero (never seen before), ANY occurrence is suspicious
+        (Baseline_HighRatio_DailyAvg == 0.0 and HighRatio_Count > 0)
+        or
+        // If baseline exists, flag when detection window exceeds it by the multiplier
+        (Baseline_HighRatio_DailyAvg > 0.0 and HighRatio_DailyAvg > Baseline_HighRatio_DailyAvg * HighRatioMultiplier)
+    | project AccountUpn, HighRatio_Count, HighRatio_Types, HighRatio_DailyAvg, Baseline_HighRatio_DailyAvg;
+// =================================================================================
+// STEP 4: DETECTION LAYER 3 - Behavioral Shift (Technique Substitution)
+// =================================================================================
+// Detects when a frequently-used technique drops significantly while other
+// high-risk actions continue — a pattern consistent with an attacker pivoting
+// to alternative lateral movement methods.
+let TechniqueBaseline = IdentityDirectoryEvents
+    | where TimeGenerated between (BaselineStart .. BaselineEnd)
+    | where AccountUpn in~ ((AllPrivilegedUsers | project AccountUPN))
+    | where ActionType == MonitoredTechnique
+    | summarize 
+        Technique_BaselineTotal = count(), 
+        Technique_BaselineDailyAvg = count() / todouble(BaselineDays) 
+        by AccountUpn;
+let TechniqueRecent = IdentityDirectoryEvents
+    | where TimeGenerated between (DetectionStart .. DetectionEnd)
+    | where AccountUpn in~ ((AllPrivilegedUsers | project AccountUPN))
+    | where ActionType == MonitoredTechnique
+    | summarize 
+        Technique_RecentTotal = count(), 
+        Technique_RecentDailyAvg = count() / todouble(DetectionDays) 
+        by AccountUpn;
+let OtherActionsRecent = IdentityDirectoryEvents
+    | where TimeGenerated between (DetectionStart .. DetectionEnd)
+    | where AccountUpn in~ ((AllPrivilegedUsers | project AccountUPN))
+    | where ActionType in (HighRiskActions) and ActionType != MonitoredTechnique
+    | summarize OtherActions_RecentTotal = count() by AccountUpn;
+let BehavioralShiftAlerts = TechniqueBaseline
+    | join kind=leftouter (TechniqueRecent) on AccountUpn
+    | join kind=leftouter (OtherActionsRecent) on AccountUpn
+    | extend 
+        Technique_RecentTotal = coalesce(Technique_RecentTotal, 0),
+        Technique_RecentDailyAvg = coalesce(Technique_RecentDailyAvg, 0.0),
+        OtherActions_RecentTotal = coalesce(OtherActions_RecentTotal, 0)
+    // Self-calibrating: technique must drop by ShiftDropPercent of its own baseline
+    | where Technique_BaselineDailyAvg > 0.0
+        and Technique_RecentDailyAvg < Technique_BaselineDailyAvg * ((100.0 - ShiftDropPercent) / 100.0)
+        and OtherActions_RecentTotal >= ShiftMinOtherActions
+    | extend BehavioralShift_Detected = true
+    | project 
+        AccountUpn, 
+        Technique_BaselineDailyAvg, 
+        Technique_RecentDailyAvg, 
+        OtherActions_RecentTotal, 
+        BehavioralShift_Detected;
+// =================================================================================
+// STEP 5: DETECTION LAYER 4 - Time-Series Anomaly Detection (High-Risk Actions)
+// =================================================================================
+// Uses Kusto's built-in series_decompose_anomalies() to statistically identify
+// days with abnormal spikes in high-risk action volume per privileged account.
+let DailyHighRiskSeries = IdentityDirectoryEvents
+    | where TimeGenerated between (BaselineStart .. DetectionEnd)
+    | where AccountUpn in~ ((AllPrivilegedUsers | project AccountUPN))
+    | where ActionType in (HighRiskActions)
+    | summarize DailyCount = count() by AccountUpn, bin(TimeGenerated, 1d)
+    | summarize 
+        Timeline = make_list(TimeGenerated),
+        Values = make_list(DailyCount)
+        by AccountUpn;
+let TimeSeriesAnomalies = DailyHighRiskSeries
+    | extend series_decompose_anomalies(Values, AnomalyThreshold)
+    | extend 
+        AnomalyFlags = series_decompose_anomalies_Values_ad_flag,
+        AnomalyScores = series_decompose_anomalies_Values_ad_score,
+        Baseline = series_decompose_anomalies_Values_baseline
+    | mv-expand 
+        Timeline to typeof(datetime),
+        Values to typeof(long),
+        AnomalyFlags to typeof(int),
+        AnomalyScores to typeof(double),
+        Baseline to typeof(double)
+    | where Timeline >= DetectionStart
+    | where AnomalyFlags == 1  // Positive anomalies only (spikes, not drops)
+    | summarize 
+        ML_AnomalyDays = count(),
+        ML_MaxScore = max(AnomalyScores),
+        ML_AnomalyDates = make_set(Timeline),
+        ML_TotalAnomalousActivity = sum(Values)
+        by AccountUpn;
+// =================================================================================
+// STEP 6: DETECTION LAYER 5 - Reconnaissance Anomaly Detection
+// =================================================================================
+// Same statistical approach as Layer 4, applied to IdentityQueryEvents to detect
+// abnormal LDAP/directory query bursts indicating pre-attack enumeration.
+let DailyReconSeries = IdentityQueryEvents
+    | where TimeGenerated between (BaselineStart .. DetectionEnd)
+    | where AccountUpn in~ ((AllPrivilegedUsers | project AccountUPN))
+    | summarize DailyCount = count() by AccountUpn, bin(TimeGenerated, 1d)
+    | summarize 
+        Timeline = make_list(TimeGenerated),
+        Values = make_list(DailyCount)
+        by AccountUpn;
+let ReconAnomalies = DailyReconSeries
+    | extend series_decompose_anomalies(Values, AnomalyThreshold)
+    | extend 
+        AnomalyFlags = series_decompose_anomalies_Values_ad_flag,
+        AnomalyScores = series_decompose_anomalies_Values_ad_score
+    | mv-expand 
+        Timeline to typeof(datetime),
+        Values to typeof(long),
+        AnomalyFlags to typeof(int),
+        AnomalyScores to typeof(double)
+    | where Timeline >= DetectionStart
+    | where AnomalyFlags == 1
+    | summarize 
+        Recon_AnomalyDays = count(),
+        Recon_MaxScore = max(AnomalyScores),
+        Recon_AnomalyDates = make_set(Timeline)
+        by AccountUpn;
+// =================================================================================
+// STEP 7: DETECTION LAYER 6 - MFA Gap Detection
+// =================================================================================
+// Flags privileged accounts that successfully authenticated without MFA.
+// Any MFA gap on a privileged account is a potential indicator of compromise
+// or misconfigured Conditional Access policies.
+let MFAGaps = SigninLogs
+    | where TimeGenerated between (DetectionStart .. DetectionEnd)
+    | where UserPrincipalName in~ ((AllPrivilegedUsers | project AccountUPN))
+    | extend MFAEnforced = AuthenticationRequirement == "multiFactorAuthentication"
+    | summarize 
+        MFA_TotalSignins = count(),
+        MFA_Successful = countif(ResultType == 0),
+        MFA_Gaps = countif(not(MFAEnforced) and ResultType == 0)
+        by UserPrincipalName
+    | extend MFA_GapPercent = iff(MFA_Successful == 0, 0.0, round(todouble(MFA_Gaps) / todouble(MFA_Successful) * 100, 2))
+    | where MFA_Gaps > 0;
+// =================================================================================
+// STEP 8: Combine All Detection Layers
+// =================================================================================
+AllPrivilegedUsers
+| join kind=leftouter (NeverActionAlerts) on $left.AccountUPN == $right.AccountUpn
+| join kind=leftouter (HighRatioAlerts) on $left.AccountUPN == $right.AccountUpn
+| join kind=leftouter (BehavioralShiftAlerts) on $left.AccountUPN == $right.AccountUpn
+| join kind=leftouter (TimeSeriesAnomalies) on $left.AccountUPN == $right.AccountUpn
+| join kind=leftouter (ReconAnomalies) on $left.AccountUPN == $right.AccountUpn
+| join kind=leftouter (MFAGaps) on $left.AccountUPN == $right.UserPrincipalName
+// Fill nulls for accounts where a layer didn't trigger
+| extend 
+    NeverAction_Count = coalesce(NeverAction_Count, 0),
+    NeverAction_Types = coalesce(NeverAction_Types, dynamic([])),
+    NeverAction_Targets = coalesce(NeverAction_Targets, dynamic([])),
+    HighRatio_Count = coalesce(HighRatio_Count, 0),
+    HighRatio_DailyAvg = coalesce(HighRatio_DailyAvg, 0.0),
+    Baseline_HighRatio_DailyAvg = coalesce(Baseline_HighRatio_DailyAvg, 0.0),
+    BehavioralShift_Detected = coalesce(BehavioralShift_Detected, false),
+    Technique_BaselineDailyAvg = coalesce(Technique_BaselineDailyAvg, 0.0),
+    Technique_RecentDailyAvg = coalesce(Technique_RecentDailyAvg, 0.0),
+    OtherActions_RecentTotal = coalesce(OtherActions_RecentTotal, 0),
+    ML_AnomalyDays = coalesce(ML_AnomalyDays, 0),
+    ML_MaxScore = coalesce(ML_MaxScore, 0.0),
+    ML_AnomalyDates = coalesce(ML_AnomalyDates, dynamic([])),
+    ML_TotalAnomalousActivity = coalesce(ML_TotalAnomalousActivity, 0),
+    Recon_AnomalyDays = coalesce(Recon_AnomalyDays, 0),
+    Recon_MaxScore = coalesce(Recon_MaxScore, 0.0),
+    Recon_AnomalyDates = coalesce(Recon_AnomalyDates, dynamic([])),
+    MFA_Gaps = coalesce(MFA_Gaps, 0),
+    MFA_GapPercent = coalesce(MFA_GapPercent, 0.0)
+// =================================================================================
+// STEP 9: Calculate Composite Risk Score
+// =================================================================================
+| extend 
+    Score_NeverActions = iff(NeverAction_Count > 0, Weight_NeverAction, 0.0),
+    Score_HighRatio = HighRatio_DailyAvg * Weight_HighRatio,
+    Score_BehavioralShift = iff(BehavioralShift_Detected, Weight_BehavioralShift, 0.0),
+    Score_MLAnomaly = ML_MaxScore * Weight_MLAnomaly,
+    Score_ReconAnomaly = Recon_MaxScore * Weight_ReconAnomaly,
+    Score_MFAGap = MFA_GapPercent * Weight_MFAGap
+| extend 
+    TotalScore = round(
+        Score_NeverActions +
+        Score_HighRatio +
+        Score_BehavioralShift +
+        Score_MLAnomaly +
+        Score_ReconAnomaly +
+        Score_MFAGap
+    , 2)
+// =================================================================================
+// STEP 10: Set Detection Flags
+// =================================================================================
+| extend
+    Flag_NeverAction = NeverAction_Count > 0,
+    Flag_HighRatioAction = HighRatio_Count > 0,
+    Flag_BehavioralShift = BehavioralShift_Detected,
+    Flag_MLAnomaly = ML_AnomalyDays > 0,
+    Flag_ReconAnomaly = Recon_AnomalyDays > 0,
+    Flag_MFAGap = MFA_Gaps > 0,
+    DetectionLayersTriggered = 
+        iff(NeverAction_Count > 0, 1, 0) +
+        iff(HighRatio_Count > 0, 1, 0) +
+        iff(BehavioralShift_Detected, 1, 0) +
+        iff(ML_AnomalyDays > 0, 1, 0) +
+        iff(Recon_AnomalyDays > 0, 1, 0) +
+        iff(MFA_Gaps > 0, 1, 0)
+// =================================================================================
+// STEP 11: Filter and Output
+// =================================================================================
+| where DetectionLayersTriggered > 0
+| project
+    AccountUPN,
+    DetectionSource,
+    Roles,
+    TotalScore,
+    DetectionLayersTriggered,
+    // Detection Flags
+    Flag_NeverAction,
+    Flag_HighRatioAction,
+    Flag_BehavioralShift,
+    Flag_MLAnomaly,
+    Flag_ReconAnomaly,
+    Flag_MFAGap,
+    // Layer 1: Never Actions Detail
+    NeverAction_Count,
+    NeverAction_Types,
+    NeverAction_Targets,
+    // Layer 2: High Ratio Actions Detail
+    HighRatio_Count,
+    HighRatio_DailyAvg = round(HighRatio_DailyAvg, 2),
+    Baseline_HighRatio_DailyAvg = round(Baseline_HighRatio_DailyAvg, 4),
+    // Layer 3: Behavioral Shift Detail
+    MonitoredTechnique = MonitoredTechnique,
+    Technique_BaselineDailyAvg = round(Technique_BaselineDailyAvg, 2),
+    Technique_RecentDailyAvg = round(Technique_RecentDailyAvg, 2),
+    OtherActions_RecentTotal,
+    // Layer 4: ML Anomaly Detail
+    ML_AnomalyDays,
+    ML_MaxScore = round(ML_MaxScore, 2),
+    ML_AnomalyDates,
+    ML_TotalAnomalousActivity,
+    // Layer 5: Recon Anomaly Detail
+    Recon_AnomalyDays,
+    Recon_MaxScore = round(Recon_MaxScore, 2),
+    Recon_AnomalyDates,
+    // Layer 6: MFA Detail
+    MFA_Gaps,
+    MFA_GapPercent
+| sort by TotalScore desc

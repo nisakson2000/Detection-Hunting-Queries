@@ -1,0 +1,50 @@
+// Name: Email Delivery Telemetry Query
+// Author: Nicholas Isakson 
+// Purpose: Identify which accounts receive the most email and highest threat exposure. Can be run for all users or a specific list.
+//
+// This query has been updated to be more flexible and provide deeper security insights.
+// Key improvements:
+// 1. The query can now run against all users by default if the 'RecipientsList' is left empty.
+// 2. A new metric, 'ThreatsDelivered', has been added to identify the highest-risk scenario: malicious emails that reached a user's inbox.
+// 3. The final output is sorted by 'ThreatsDelivered' to immediately highlight the most impacted accounts.
+
+let lookback = ago(90d); // Set the timeframe for the analysis.
+// To scope down to specific users, add email addresses here, e.g., dynamic(["user1@contoso.com", "user2@contoso.com"]).
+// If left empty, the query will run for all users.
+let RecipientsList = dynamic([]);
+EmailEvents
+| where TimeGenerated > lookback
+| where EmailDirection == "Inbound"
+// The following filter is only applied if the RecipientsList is populated.
+| where array_length(RecipientsList) == 0 or RecipientEmailAddress in~ (RecipientsList)
+// Deduplicate email events to get the latest action/verdict for each message. This is crucial for accuracy (e.g., reflecting post-delivery ZAP actions).
+| summarize arg_max(TimeGenerated, *) by NetworkMessageId, RecipientEmailAddress
+| summarize
+    TotalEmails = count(),
+    Delivered = countif(DeliveryAction == "Delivered"),
+    Junked = countif(DeliveryAction == "Junked"),
+    Blocked = countif(DeliveryAction == "Blocked"),
+    // Count emails where any threat (Phish, Malware, Spam) was identified.
+    ThreatsDetected = countif(isnotempty(ThreatTypes)),
+    // A key risk indicator: count threats that were not stopped and made it to the user's inbox.
+    ThreatsDelivered = countif(isnotempty(ThreatTypes) and DeliveryAction == "Delivered"),
+    PhishDetected = countif(ThreatTypes has "Phish"),
+    SpamDetected = countif(ThreatTypes has "Spam"),
+    MalwareDetected = countif(ThreatTypes has "Malware")
+    by RecipientEmailAddress
+// Calculate the percentage of total emails that contained a threat.
+| extend ThreatRate = iif(TotalEmails > 0, round(todecimal(ThreatsDetected) / todecimal(TotalEmails) * 100, 2), 0.0)
+// Reorder columns for better readability and sort by the highest volume of delivered threats.
+| project-reorder
+    RecipientEmailAddress,
+    ThreatsDelivered,
+    TotalEmails,
+    ThreatRate,
+    Delivered,
+    ThreatsDetected,
+    PhishDetected,
+    MalwareDetected,
+    SpamDetected,
+    Junked,
+    Blocked
+| order by ThreatsDelivered desc, TotalEmails desc

@@ -1,0 +1,34 @@
+// Name: ChatGPT Stealer Extension IDs
+// Author: Nicholas Isakson
+// Date: 2026-02-20
+// Description: This rule detects the presence of known malicious browser extension IDs associated with the ChatGPT Stealer campaign. These extensions are known to steal AI session tokens and conversation data.
+// MITRE ATT&CK: T1176 (Browser Extensions)
+// References:
+// - https://layerxsecurity.com/blog/how-we-discovered-a-campaign-of-16-malicious-extensions-chatgpt/
+// - https://www.ox.security/blog/malicious-chrome-extensions-steal-chatgpt-deepseek-conversations/
+// - https://cybersecuritynews.com/16-malicious-chrome-extensions-as-chatgpt-enhancements/
+
+// Define the list of known malicious extension IDs
+let MaliciousExtensionIDs = dynamic([
+    "fnmihdojmnkclgjpcoonokmkhjpjechg",
+    "inhcgfpbfdjbjogdfjbclgolkmhnooop",
+    "gbcgjnbccjojicobfimcnfjddhpphaod",
+    "fppbiomdkfbhgjjdmojlogeceejinadg"
+]);
+// Search for file events related to the installation of these extensions
+DeviceFileEvents
+// Filter for file creation or renaming, which occurs during installation
+| where ActionType in ("FileCreated", "FileRenamed")
+// Check if the file path or name contains any of the malicious extension IDs.
+| where FolderPath has_any (MaliciousExtensionIDs) or FileName has_any (MaliciousExtensionIDs)
+// To reduce potential false positives, consider adding more specific path filters to ensure the path is related to a known browser's extension directory.
+// For example: | where FolderPath has_all (@"\AppData\Local\", @"\Extensions\") // Example for Windows
+| project
+    TimeGenerated,
+    DeviceName,
+    ActionType,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    FileName,
+    FolderPath,
+    SHA256

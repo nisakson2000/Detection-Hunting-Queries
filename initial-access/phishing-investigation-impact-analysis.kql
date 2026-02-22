@@ -1,0 +1,119 @@
+// =============================================================================
+// EMAIL INVESTIGATION & TRIAGE QUERY
+// =============================================================================
+// Correlates email delivery, URLs, clicks, attachments, endpoint file activity,
+// and reply behavior into a single view. One row per recipient — handles
+// distribution list expansion natively.
+//
+// DATA SOURCES: EmailEvents, EmailUrlInfo, UrlClickEvents, EmailAttachmentInfo,
+//               DeviceFileEvents
+// PLATFORM:     Microsoft Sentinel (TimeGenerated). For Defender XDR Advanced
+//               Hunting, replace TimeGenerated with Timestamp.
+// MITRE:        T1566.001, T1566.002, T1534, T1204.001, T1204.002
+// AUTHOR:       Nicholas Isakson
+// =============================================================================
+// --- TUNABLE PARAMETERS ---
+let endDate = datetime_local_to_utc(todatetime('2026-02-10 18:00:00'), 'US/Pacific');
+let startDate = endDate - 90d;
+let deviceLookback = 90d;
+// --- SEARCH PARAMETERS ---
+// Use =~ for full addresses/domains. Use contains for subjects or partial values.
+// Avoid has on email addresses — term tokenization breaks on @ and . characters.
+let searchSenderAddress = @"<SENDER_EMAIL_ADDRESS>";
+let searchDomain = @"<SENDER_DOMAIN>";
+let searchSubject = @"<SUBJECT_LINE_OR_FRAGMENT>";
+let excludeMailbox = @"<PHISHING_REPORTING_MAILBOX>"; // Remove exclusion filters below if not needed
+// =============================================================================
+// Base emails — one row per recipient
+let BaseEmails =
+    EmailEvents
+    | where TimeGenerated between (startDate .. endDate)
+    | where (SenderFromAddress =~ searchSenderAddress)
+        or (RecipientDomain =~ searchDomain)
+        or (SenderFromDomain =~ searchDomain)
+        // Occasionally, a broad subject may be encountered that uses a lot of resources.
+        // If that happens, comment out the Subject section below. You don't need to touch the Tunable Parameters.
+        or (Subject contains searchSubject)
+    | where RecipientEmailAddress != excludeMailbox
+    | where SenderFromAddress != excludeMailbox
+    | project TimeGenerated, NetworkMessageId, InternetMessageId,
+        SenderFromAddress, RecipientEmailAddress, Subject,
+        DeliveryAction, DeliveryLocation, EmailDirection, EmailClusterId;
+// URLs embedded in matching emails
+let EmailUrls =
+    EmailUrlInfo
+    | where TimeGenerated between (startDate .. endDate)
+    | project NetworkMessageId, Url;
+// URL click events (requires Safe Links — empty if not enabled)
+let UrlClicks =
+    UrlClickEvents
+    | where TimeGenerated between (startDate .. endDate)
+    | project NetworkMessageId, ClickedUrl = Url, ClickTime = TimeGenerated;
+// Attachments with endpoint file hash correlation
+let Attachments =
+    EmailAttachmentInfo
+    | where TimeGenerated between (startDate .. endDate)
+    | project NetworkMessageId, RecipientEmailAddress, FileName, SHA256
+    | join kind=leftouter (
+        DeviceFileEvents
+        | where TimeGenerated > ago(deviceLookback)
+        | where isnotempty(SHA256)
+        | summarize
+            DeviceNames = make_set(DeviceName),
+            FileActions = make_set(ActionType)
+            by SHA256
+    ) on SHA256
+    | extend DeviceActivity = iff(isnotempty(DeviceNames),
+        strcat(FileName, " → ", tostring(FileActions), " on ", tostring(DeviceNames)), "")
+    | project NetworkMessageId, RecipientEmailAddress, FileName, DeviceActivity;
+// Reply detection via sender/recipient swap + subject threading
+let Replies =
+    BaseEmails
+    | join kind=inner (
+        EmailEvents
+        | where TimeGenerated between (startDate .. endDate)
+        | where EmailDirection == "Outbound" or EmailDirection == "Intra-org"
+        | project ReplyTime = TimeGenerated, ReplySender = SenderFromAddress,
+            ReplyRecipient = RecipientEmailAddress, ReplySubject = Subject
+    ) on $left.RecipientEmailAddress == $right.ReplySender,
+       $left.SenderFromAddress == $right.ReplyRecipient
+    | where ReplyTime > TimeGenerated
+    // Subject threading — comment out if replies heavily modify subjects
+    | where ReplySubject has extract(@"^(?:RE:\s*|FW:\s*)*(.+)", 1, Subject)
+    | summarize ReplyCount = count(), EarliestReply = min(ReplyTime)
+        by NetworkMessageId, RecipientEmailAddress;
+// --- FINAL ASSEMBLY ---
+BaseEmails
+| join kind=leftouter (EmailUrls) on NetworkMessageId
+| join kind=leftouter (UrlClicks) on NetworkMessageId, $left.Url == $right.ClickedUrl
+| join kind=leftouter (Attachments) on NetworkMessageId, RecipientEmailAddress
+| join kind=leftouter (Replies) on NetworkMessageId, RecipientEmailAddress
+| summarize
+    ['Time Generated'] = min(TimeGenerated),
+    Subject = any(Subject),
+    Sender = any(SenderFromAddress),
+    ['Delivery Action'] = any(DeliveryAction),
+    ['Delivery Location'] = any(DeliveryLocation),
+    Direction = any(EmailDirection),
+    ['Internet Message ID'] = any(InternetMessageId),
+    ['All Observed URLs'] = make_set(Url),
+    ['Clicked URLs'] = make_set(ClickedUrl),
+    ['Click Times'] = make_set(ClickTime),
+    ['All Attachments'] = make_set(FileName),
+    ['Attachment On Device'] = make_set_if(DeviceActivity, isnotempty(DeviceActivity)),
+    ['Reply Count'] = sum(ReplyCount),
+    ['Earliest Reply'] = min(EarliestReply)
+    by NetworkMessageId, RecipientEmailAddress
+| extend ['User Replied'] = iff(['Reply Count'] > 0,
+    strcat("YES (", ['Reply Count'], "x, first: ",
+        format_datetime(['Earliest Reply'], 'yyyy-MM-dd HH:mm'), ")"),
+    "No")
+| project-rename
+    ['Network Message ID'] = NetworkMessageId,
+    Recipient = RecipientEmailAddress
+| project-reorder
+    ['Time Generated'], ['Network Message ID'], Sender, Recipient, Subject,
+    Direction, ['Delivery Action'], ['Delivery Location'], ['User Replied'],
+    ['All Attachments'], ['Attachment On Device'], ['Clicked URLs'],
+    ['Click Times'], ['All Observed URLs'], ['Internet Message ID']
+| sort by ['Time Generated'] desc

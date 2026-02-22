@@ -1,0 +1,62 @@
+// Name: Generic Vulnerable Software Discovery
+// Author: Nicholas I. 
+// Date: 2026-01-23
+//
+// Description:
+// This query identifies devices with specific versions of installed software that are considered vulnerable.
+// It is a template that can be easily adapted to track any software by changing the placeholder variables.
+// It enriches the findings with device and user information for easier investigation.
+//
+// Tactic: Discovery
+// Technique: T1518.001 (Security Software Discovery)
+//
+// Data Source: Microsoft Defender for Endpoint (DeviceTvmSoftwareInventory, DeviceInfo)
+
+// --- Query Parameters ---
+// Define the parameters for the vulnerable software you want to find.
+let TargetSoftwareName = "Firefox"; // <-- Specify the software name (e.g., "Notepad++", "7-Zip", "Google Chrome"). Use 'has' for partial matches.
+let VulnerableVersion = "145.0"; // <-- Specify the version number to compare against.
+let ComparisonOperator = "<"; // <-- Specify the comparison operator: '<', '>', '==', '!='.
+let OptionalCVE = "CVE-2025-13016"; // <-- Specify the relevant CVE, or leave blank (e.g., "") if not applicable.
+let Lookback = 30d; // Time window to look back for device information.
+// --- Query Logic ---
+// Step 1: Get recent device activity and enrich with the primary user.
+let RecentDevices = DeviceInfo
+| where TimeGenerated > ago(Lookback)
+| summarize arg_max(TimeGenerated, *) by DeviceId
+// Get the primary user from the LoggedOnUsers JSON array.
+| extend PrimaryUser = tostring(parse_json(LoggedOnUsers)[0].UserName)
+| project
+    DeviceId,
+    DeviceName,
+    OSPlatform,
+    PublicIP,
+    PrimaryUser,
+    DeviceLastSeen = TimeGenerated;
+// Step 2: Find devices with the specified vulnerable software version.
+let VulnerableSoftware = DeviceTvmSoftwareInventory
+| where SoftwareName has TargetSoftwareName
+// LOGIC: Dynamically compare software versions.
+// This block uses a trick to allow the operator to be a variable.
+// You can also replace this block with a simpler, hardcoded comparison like:
+// | where parse_version(SoftwareVersion) < parse_version(VulnerableVersion)
+| where (ComparisonOperator == "<" and parse_version(SoftwareVersion) < parse_version(VulnerableVersion))
+    or (ComparisonOperator == ">" and parse_version(SoftwareVersion) > parse_version(VulnerableVersion))
+    or (ComparisonOperator == "==" and parse_version(SoftwareVersion) == parse_version(VulnerableVersion))
+    or (ComparisonOperator == "!=" and parse_version(SoftwareVersion) != parse_version(VulnerableVersion))
+| project DeviceId, SoftwareName, SoftwareVersion;
+// Step 3: Join vulnerable software data with enriched device information for the final report.
+VulnerableSoftware
+| join kind=inner (RecentDevices) on DeviceId
+| extend CVE = OptionalCVE
+| project
+    DeviceLastSeen,
+    DeviceName,
+    PrimaryUser,
+    PublicIP,
+    OSPlatform,
+    SoftwareName,
+    SoftwareVersion,
+    CVE,
+    Status = "VULNERABLE"
+| order by DeviceLastSeen desc

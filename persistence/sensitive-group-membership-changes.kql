@@ -1,0 +1,34 @@
+SecurityEvent
+// Extend custom columns with user-friendly names first, as per the original query style.
+| extend ['Admin Group(s)'] = TargetUserName
+| extend ['User Behind the Activity'] = SubjectUserName
+| extend ['Member Added or Removed'] = MemberName
+// Filter for events indicating a member was added (4728) or removed (4729) from a security group.
+| where EventID in (4728, 4729)
+// Filter for modifications only to the predefined list of sensitive groups.
+// The list has been corrected to fix a typo ("Adminstrators") and a formatting error where multiple groups were a single string.
+| where ['Admin Group(s)'] in~ (
+    "Administrators",
+    "Domain Admins",
+    "Enterprise Admins",
+    "Schema Admins",
+    "Exmerge",
+    "AC-ServerAdmins_Network",
+    "AC-ServerAdmins_ServiceAccts"
+)
+// Exclude changes made by computer accounts (ending in '$'), which are often automated and can be noisy.
+// This is a common tuning step to reduce false positives from legitimate system activity.
+| where ['User Behind the Activity'] !endswith "$"
+// Create a column to describe the action taken based on the EventID.
+| extend Action = iff(EventID == 4728, "Member Added", "Member Removed")
+// Project the final columns in the desired order.
+| project
+    TimeGenerated,
+    Action,
+    ['Admin Group(s)'],
+    ['Member Added or Removed'],
+    ['User Behind the Activity'],
+    Computer,
+    AccountType,
+    EventData,
+    Activity
