@@ -13,16 +13,15 @@
 // AUTHOR:       Nicholas Isakson
 // =============================================================================
 // --- TUNABLE PARAMETERS ---
-let endDate = datetime_local_to_utc(todatetime('2026-02-10 18:00:00'), 'US/Pacific');
+let endDate = datetime_local_to_utc(todatetime('2026-02-23 18:00:00'), 'US/Pacific');
 let startDate = endDate - 90d;
 let deviceLookback = 90d;
 // --- SEARCH PARAMETERS ---
-// Use =~ for full addresses/domains. Use contains for subjects or partial values.
-// Avoid has on email addresses — term tokenization breaks on @ and . characters.
 let searchSenderAddress = @"<SENDER_EMAIL_ADDRESS>";
 let searchDomain = @"<SENDER_DOMAIN>";
 let searchSubject = @"<SUBJECT_LINE_OR_FRAGMENT>";
 let excludeMailbox = @"<PHISHING_REPORTING_MAILBOX>"; // Remove exclusion filters below if not needed
+//
 // =============================================================================
 // Base emails — one row per recipient
 let BaseEmails =
@@ -31,8 +30,6 @@ let BaseEmails =
     | where (SenderFromAddress =~ searchSenderAddress)
         or (RecipientDomain =~ searchDomain)
         or (SenderFromDomain =~ searchDomain)
-        // Occasionally, a broad subject may be encountered that uses a lot of resources.
-        // If that happens, comment out the Subject section below. You don't need to touch the Tunable Parameters.
         or (Subject contains searchSubject)
     | where RecipientEmailAddress != excludeMailbox
     | where SenderFromAddress != excludeMailbox
@@ -44,7 +41,7 @@ let EmailUrls =
     EmailUrlInfo
     | where TimeGenerated between (startDate .. endDate)
     | project NetworkMessageId, Url;
-// URL click events (requires Safe Links — empty if not enabled)
+// URL click events
 let UrlClicks =
     UrlClickEvents
     | where TimeGenerated between (startDate .. endDate)
@@ -66,7 +63,7 @@ let Attachments =
     | extend DeviceActivity = iff(isnotempty(DeviceNames),
         strcat(FileName, " → ", tostring(FileActions), " on ", tostring(DeviceNames)), "")
     | project NetworkMessageId, RecipientEmailAddress, FileName, DeviceActivity;
-// Reply detection via sender/recipient swap + subject threading
+// Reply detection
 let Replies =
     BaseEmails
     | join kind=inner (
@@ -78,7 +75,6 @@ let Replies =
     ) on $left.RecipientEmailAddress == $right.ReplySender,
        $left.SenderFromAddress == $right.ReplyRecipient
     | where ReplyTime > TimeGenerated
-    // Subject threading — comment out if replies heavily modify subjects
     | where ReplySubject has extract(@"^(?:RE:\s*|FW:\s*)*(.+)", 1, Subject)
     | summarize ReplyCount = count(), EarliestReply = min(ReplyTime)
         by NetworkMessageId, RecipientEmailAddress;
