@@ -42,11 +42,20 @@ let BaseEmails =
         or (isnotempty(searchSubject) and Subject contains searchSubject)
     | where RecipientEmailAddress != excludeMailbox
     | where SenderFromAddress != excludeMailbox
-    | project TimeGenerated, NetworkMessageId, InternetMessageId,
-        SenderFromAddress, RecipientEmailAddress, Subject,
-        DeliveryAction, DeliveryLocation, EmailDirection, EmailClusterId;
+    | project
+        TimeGenerated,
+        NetworkMessageId,
+        InternetMessageId,
+        SenderFromAddress,
+        RecipientEmailAddress,
+        Subject,
+        DeliveryAction,
+        DeliveryLocation,
+        EmailDirection,
+        EmailClusterId;
 // Scope downstream joins to only our messages
-let MessageIds = BaseEmails | distinct NetworkMessageId;
+let MessageIds = BaseEmails
+    | distinct NetworkMessageId;
 // URLs — scoped to only our messages
 let EmailUrls =
     EmailUrlInfo
@@ -73,16 +82,22 @@ let Attachments =
             DeviceNames = make_set(DeviceName),
             FileActions = make_set(ActionType)
             by SHA256
-    ) on SHA256
-    | extend DeviceActivity = iff(isnotempty(DeviceNames),
-        strcat(FileName, " → ", tostring(FileActions), " on ", tostring(DeviceNames)), "")
+        )
+        on SHA256
+    | extend DeviceActivity = iff(
+                              isnotempty(DeviceNames),
+                              strcat(FileName, " → ", tostring(FileActions), " on ", tostring(DeviceNames)),
+                              ""
+                          )
     | project NetworkMessageId, RecipientEmailAddress, FileName, DeviceActivity;
 // Post-delivery actions (ZAP, manual remediation) — scoped to only our messages
 let PostDelivery =
     EmailPostDeliveryEvents
     | where TimeGenerated between (startDate .. endDate)
     | join kind=inner hint.strategy=broadcast (MessageIds) on NetworkMessageId
-    | project NetworkMessageId, RecipientEmailAddress,
+    | project
+        NetworkMessageId,
+        RecipientEmailAddress,
         PostAction = ActionType,
         PostActionResult = ActionResult,
         PostDeliveryLocation = DeliveryLocation,
@@ -94,10 +109,15 @@ let Replies =
         EmailEvents
         | where TimeGenerated between (startDate .. endDate)
         | where EmailDirection == "Outbound" or EmailDirection == "Intra-org"
-        | project ReplyTime = TimeGenerated, ReplySender = SenderFromAddress,
-            ReplyRecipient = RecipientEmailAddress, ReplySubject = Subject
-    ) on $left.RecipientEmailAddress == $right.ReplySender,
-       $left.SenderFromAddress == $right.ReplyRecipient
+        | project
+            ReplyTime = TimeGenerated,
+            ReplySender = SenderFromAddress,
+            ReplyRecipient = RecipientEmailAddress,
+            ReplySubject = Subject
+        )
+        on
+        $left.RecipientEmailAddress == $right.ReplySender,
+        $left.SenderFromAddress == $right.ReplyRecipient
     | where ReplyTime > TimeGenerated
     | where ReplySubject has extract(@"^(?:RE:\s*|FW:\s*)*(.+)", 1, Subject)
     | summarize ReplyCount = count(), EarliestReply = min(ReplyTime)
@@ -129,24 +149,48 @@ BaseEmails
     ['Reply Count'] = sum(ReplyCount),
     ['Earliest Reply'] = min(EarliestReply)
     by NetworkMessageId, RecipientEmailAddress
-| extend ['User Replied'] = iff(['Reply Count'] > 0,
-    strcat("YES (", ['Reply Count'], "x, first: ",
-        format_datetime(['Earliest Reply'], 'yyyy-MM-dd HH:mm'), ")"),
-    "No")
+| extend ['User Replied'] = iff(
+                                ['Reply Count'] > 0,
+                                strcat(
+    "YES (",
+    ['Reply Count'],
+    "x, first: ",
+    format_datetime(['Earliest Reply'], 'yyyy-MM-dd HH:mm'),
+    ")"
+),
+                                "No"
+                            )
 | extend ['ZAP Status'] = case(
-    array_length(['ZAP Action']) == 0, "No ZAP",
-    ['ZAP Action'] has "ZAP" and ['ZAP Result'] has "Success", "ZAP'd ✓",
-    ['ZAP Action'] has "ZAP" and ['ZAP Result'] has "Error", "ZAP FAILED ⚠",
-    strcat("Post-Action: ", tostring(['ZAP Action']))
-    )
+                              array_length(['ZAP Action']) == 0,
+                              "No ZAP",
+                              ['ZAP Action'] has_any("ZAP") and ['ZAP Result'] has_any("Success"),
+                              "ZAP'd ✓",
+                              ['ZAP Action'] has_any("ZAP") and ['ZAP Result'] has_any("Error"),
+                              "ZAP FAILED ⚠",
+                              strcat("Post-Action: ", tostring(['ZAP Action']))
+                          )
 | project-rename
     ['Network Message ID'] = NetworkMessageId,
     Recipient = RecipientEmailAddress
 | project-reorder
-    ['Time Generated'], ['Network Message ID'], Sender, Recipient, Subject,
-    Direction, ['Delivery Action'], ['Delivery Location'],
-    ['ZAP Status'], ['ZAP Action'], ['ZAP Result'], ['ZAP Final Location'], ['ZAP Time'],
+    ['Time Generated'],
+    ['Network Message ID'],
+    Sender,
+    Recipient,
+    Subject,
+    Direction,
+    ['Delivery Action'],
+    ['Delivery Location'],
+    ['ZAP Status'],
+    ['ZAP Action'],
+    ['ZAP Result'],
+    ['ZAP Final Location'],
+    ['ZAP Time'],
     ['User Replied'],
-    ['All Attachments'], ['Attachment On Device'], ['Clicked URLs'],
-    ['Click Times'], ['All Observed URLs'], ['Internet Message ID']
+    ['All Attachments'],
+    ['Attachment On Device'],
+    ['Clicked URLs'],
+    ['Click Times'],
+    ['All Observed URLs'],
+    ['Internet Message ID']
 | sort by ['Time Generated'] desc
