@@ -2,26 +2,35 @@
 // EMAIL INVESTIGATION & TRIAGE QUERY
 // =============================================================================
 // Correlates email delivery, URLs, clicks, attachments, endpoint file activity,
-// and reply behavior into a single view. One row per recipient — handles
-// distribution list expansion natively.
+// reply behavior, and post-delivery ZAP actions into a single view. One row per
+// recipient — handles distribution list expansion natively.
 //
 // DATA SOURCES: EmailEvents, EmailUrlInfo, UrlClickEvents, EmailAttachmentInfo,
-//               DeviceFileEvents
+//               DeviceFileEvents, EmailPostDeliveryEvents
 // PLATFORM:     Microsoft Sentinel (TimeGenerated). For Defender XDR Advanced
 //               Hunting, replace TimeGenerated with Timestamp.
 // MITRE:        T1566.001, T1566.002, T1534, T1204.001, T1204.002
 // AUTHOR:       Nicholas Isakson
 // =============================================================================
 // --- TUNABLE PARAMETERS ---
-let endDate = datetime_local_to_utc(todatetime('2026-02-23 18:00:00'), 'US/Pacific');
+let endDate = datetime_local_to_utc(todatetime('2026-02-24 18:00:00'), 'US/Pacific');
 let startDate = endDate - 90d;
-let deviceLookback = 90d;
+let deviceLookback = 30d;
 // --- SEARCH PARAMETERS ---
+// searchSenderAddress: Full email address of the sender you're investigating.
+//                      Uses =~ (case-insensitive exact match). Leave as "" if not needed.
 let searchSenderAddress = @"<SENDER_EMAIL_ADDRESS>";
+// searchDomain: Domain of the sender or recipient to match against.
+//               Matches on both SenderFromDomain and RecipientDomain via =~.
+//               Leave as "" if not needed — but at least one of these three should be populated.
 let searchDomain = @"<SENDER_DOMAIN>";
-let searchSubject = @"<SUBJECT_LINE_OR_FRAGMENT>";
-let excludeMailbox = @"<PHISHING_REPORTING_MAILBOX>"; // Remove exclusion filters below if not needed
-//
+// searchSubject: Full or partial subject line to match on.
+//                Uses contains (substring match). Leave as "" to skip — the query
+//                automatically ignores this condition when blank.
+let searchSubject = @"<SUBJECT_OR_FRAGMENT>";
+// excludeMailbox: Your org's phishing reporting mailbox to exclude from results.
+//                 Remove the two exclusion filters in BaseEmails if not applicable.
+let excludeMailbox = @"<PHISHING_REPORTING_MAILBOX>";
 // =============================================================================
 // Base emails — one row per recipient
 let BaseEmails =
@@ -30,26 +39,31 @@ let BaseEmails =
     | where (SenderFromAddress =~ searchSenderAddress)
         or (RecipientDomain =~ searchDomain)
         or (SenderFromDomain =~ searchDomain)
-        or (Subject contains searchSubject)
+        or (isnotempty(searchSubject) and Subject contains searchSubject)
     | where RecipientEmailAddress != excludeMailbox
     | where SenderFromAddress != excludeMailbox
     | project TimeGenerated, NetworkMessageId, InternetMessageId,
         SenderFromAddress, RecipientEmailAddress, Subject,
         DeliveryAction, DeliveryLocation, EmailDirection, EmailClusterId;
-// URLs embedded in matching emails
+// Scope downstream joins to only our messages
+let MessageIds = BaseEmails | distinct NetworkMessageId;
+// URLs — scoped to only our messages
 let EmailUrls =
     EmailUrlInfo
     | where TimeGenerated between (startDate .. endDate)
+    | join kind=inner hint.strategy=broadcast (MessageIds) on NetworkMessageId
     | project NetworkMessageId, Url;
-// URL click events
+// URL click events — scoped to only our messages
 let UrlClicks =
     UrlClickEvents
     | where TimeGenerated between (startDate .. endDate)
+    | join kind=inner hint.strategy=broadcast (MessageIds) on NetworkMessageId
     | project NetworkMessageId, ClickedUrl = Url, ClickTime = TimeGenerated;
-// Attachments with endpoint file hash correlation
+// Attachments — scoped to only our messages
 let Attachments =
     EmailAttachmentInfo
     | where TimeGenerated between (startDate .. endDate)
+    | join kind=inner hint.strategy=broadcast (MessageIds) on NetworkMessageId
     | project NetworkMessageId, RecipientEmailAddress, FileName, SHA256
     | join kind=leftouter (
         DeviceFileEvents
@@ -63,6 +77,16 @@ let Attachments =
     | extend DeviceActivity = iff(isnotempty(DeviceNames),
         strcat(FileName, " → ", tostring(FileActions), " on ", tostring(DeviceNames)), "")
     | project NetworkMessageId, RecipientEmailAddress, FileName, DeviceActivity;
+// Post-delivery actions (ZAP, manual remediation) — scoped to only our messages
+let PostDelivery =
+    EmailPostDeliveryEvents
+    | where TimeGenerated between (startDate .. endDate)
+    | join kind=inner hint.strategy=broadcast (MessageIds) on NetworkMessageId
+    | project NetworkMessageId, RecipientEmailAddress,
+        PostAction = ActionType,
+        PostActionResult = ActionResult,
+        PostDeliveryLocation = DeliveryLocation,
+        PostActionTime = TimeGenerated;
 // Reply detection
 let Replies =
     BaseEmails
@@ -80,10 +104,11 @@ let Replies =
         by NetworkMessageId, RecipientEmailAddress;
 // --- FINAL ASSEMBLY ---
 BaseEmails
-| join kind=leftouter (EmailUrls) on NetworkMessageId
-| join kind=leftouter (UrlClicks) on NetworkMessageId, $left.Url == $right.ClickedUrl
-| join kind=leftouter (Attachments) on NetworkMessageId, RecipientEmailAddress
-| join kind=leftouter (Replies) on NetworkMessageId, RecipientEmailAddress
+| join kind=leftouter hint.strategy=broadcast (EmailUrls) on NetworkMessageId
+| join kind=leftouter hint.strategy=broadcast (UrlClicks) on NetworkMessageId, $left.Url == $right.ClickedUrl
+| join kind=leftouter hint.strategy=broadcast (Attachments) on NetworkMessageId, RecipientEmailAddress
+| join kind=leftouter hint.strategy=broadcast (PostDelivery) on NetworkMessageId, RecipientEmailAddress
+| join kind=leftouter hint.strategy=broadcast (Replies) on NetworkMessageId, RecipientEmailAddress
 | summarize
     ['Time Generated'] = min(TimeGenerated),
     Subject = any(Subject),
@@ -92,6 +117,10 @@ BaseEmails
     ['Delivery Location'] = any(DeliveryLocation),
     Direction = any(EmailDirection),
     ['Internet Message ID'] = any(InternetMessageId),
+    ['ZAP Action'] = make_set_if(PostAction, isnotempty(PostAction)),
+    ['ZAP Result'] = make_set_if(PostActionResult, isnotempty(PostActionResult)),
+    ['ZAP Final Location'] = make_set_if(PostDeliveryLocation, isnotempty(PostDeliveryLocation)),
+    ['ZAP Time'] = min(PostActionTime),
     ['All Observed URLs'] = make_set(Url),
     ['Clicked URLs'] = make_set(ClickedUrl),
     ['Click Times'] = make_set(ClickTime),
@@ -104,12 +133,20 @@ BaseEmails
     strcat("YES (", ['Reply Count'], "x, first: ",
         format_datetime(['Earliest Reply'], 'yyyy-MM-dd HH:mm'), ")"),
     "No")
+| extend ['ZAP Status'] = case(
+    array_length(['ZAP Action']) == 0, "No ZAP",
+    ['ZAP Action'] has "ZAP" and ['ZAP Result'] has "Success", "ZAP'd ✓",
+    ['ZAP Action'] has "ZAP" and ['ZAP Result'] has "Error", "ZAP FAILED ⚠",
+    strcat("Post-Action: ", tostring(['ZAP Action']))
+    )
 | project-rename
     ['Network Message ID'] = NetworkMessageId,
     Recipient = RecipientEmailAddress
 | project-reorder
     ['Time Generated'], ['Network Message ID'], Sender, Recipient, Subject,
-    Direction, ['Delivery Action'], ['Delivery Location'], ['User Replied'],
+    Direction, ['Delivery Action'], ['Delivery Location'],
+    ['ZAP Status'], ['ZAP Action'], ['ZAP Result'], ['ZAP Final Location'], ['ZAP Time'],
+    ['User Replied'],
     ['All Attachments'], ['Attachment On Device'], ['Clicked URLs'],
     ['Click Times'], ['All Observed URLs'], ['Internet Message ID']
 | sort by ['Time Generated'] desc
