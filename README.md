@@ -30,7 +30,7 @@ Queries are organized by MITRE ATT&CK tactic. Each `.kql` file contains the full
 | Query | Technique | Description |
 |:------|:----------|:------------|
 | [Stolen Device Logon Detection](initial-access/stolen-device-logon-detection.kql) | T1078 | Detects successful logon activity on devices reported as stolen or missing, enriched with ISP IP data from Azure AD sign-in logs. |
-| [Phishing Investigation & Impact Analysis](initial-access/phishing-investigation-impact-analysis.kql) | T1566.001, T1566.002, T1204 | Comprehensive phishing triage query correlating email delivery, URL clicks, attachments, endpoint file activity, and reply behavior into a single view per recipient. |
+| [Phishing Investigation & Impact Analysis](initial-access/phishing-investigation-impact-analysis.kql) | T1566.001, T1566.002, T1204 | Comprehensive phishing triage query correlating email delivery, URL clicks, attachments, endpoint file activity, reply behavior, and post-delivery ZAP actions into a single view per recipient. |
 
 ### Discovery (TA0007)
 
