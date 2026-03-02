@@ -37,8 +37,8 @@ let BaseEmails =
     EmailEvents
     | where TimeGenerated between (startDate .. endDate)
     | where (SenderFromAddress =~ searchSenderAddress)
-        or (RecipientDomain =~ searchDomain)
-        or (SenderFromDomain =~ searchDomain)
+        or (isnotempty(RecipientDomain) and RecipientDomain =~ searchDomain)
+        or (isnotempty(SenderFromDomain) and SenderFromDomain  =~ searchDomain)
         or (isnotempty(searchSubject) and Subject contains searchSubject)
     | where RecipientEmailAddress != excludeMailbox
     | where SenderFromAddress != excludeMailbox
