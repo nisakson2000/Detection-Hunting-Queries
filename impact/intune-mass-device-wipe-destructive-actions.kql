@@ -1,0 +1,491 @@
+// =============================================================================
+// DETECTION: Stryker-Pattern Mass Device Wipe / Destructive Intune Admin Actions
+// VERSION: 1.1
+// =============================================================================
+// PURPOSE: Unified detection for mass device wipe/retire/delete operations via
+//          Microsoft Intune, inspired by the Stryker/Handala attack (March 2026).
+//          Combines five detection signals into one scheduled analytics rule:
+//            Signal 1 - Static velocity threshold (hard floor — belt)
+//            Signal 2 - Bulk destructive actions from a single operator
+//            Signal 3 - First-time operator (no history in 14-day baseline)
+//            Signal 4 - UEBA anomaly correlation (Anomalies + BehaviorAnalytics)
+//            Signal 5 - ML anomaly detection via series_decompose_anomalies()
+//                       (per-operator behavioral baseline — suspenders)
+//          Each signal fires independently; severity escalates on signal overlap.
+//          Operations are split into two tiers based on baseline analysis:
+//            Tier 1 (Critical) — Full device wipe/retire. In most environments
+//                                these actions are rare or nonexistent. ANY
+//                                occurrence should be treated as anomalous.
+//            Tier 2 (High) — Device delete. Legitimate IT ops activity typically
+//                            exists, so velocity thresholds and ML baselines apply.
+//
+// TABLES REQUIRED:
+//   - IntuneAuditLogs (Intune diagnostic settings -> Log Analytics)
+//   - Anomalies (Sentinel UEBA anomaly rules — must be enabled)
+//   - BehaviorAnalytics (Sentinel UEBA — must be enabled)
+//   - IdentityInfo (Sentinel UEBA — synced from Entra ID / Defender for Identity)
+//
+// MITRE ATT&CK:
+//   - Tactic: Impact (TA0040)
+//     - Technique: Data Destruction (T1485)
+//     - Technique: Disk Wipe (T1561) / Sub-technique: Disk Content Wipe (T1561.001)
+//   - Tactic: Persistence (TA0003)
+//     - Technique: Account Manipulation (T1098)
+//   - Tactic: Privilege Escalation (TA0004)
+//     - Technique: Abuse Elevation Control Mechanism (T1548)
+//
+// CONNECTOR PREREQUISITE: Intune Diagnostic Settings must be configured to send
+//   AuditLogs to the Log Analytics workspace backing Microsoft Sentinel.
+//   Path: Intune Admin Center > Reports > Diagnostic settings > Add diagnostic setting
+//   Categories: AuditLogs (required), OperationalLogs (recommended)
+//
+// DEPLOYMENT NOTES:
+//   1. Run the discovery query at the bottom of this file FIRST to map your
+//      environment's baseline wipe/retire/delete activity before deploying.
+//   2. Populate the SuppressedOperators and SuppressedApplications lists
+//      based on your discovery results.
+//   3. Adjust Tier1Threshold and Tier2Threshold based on your baseline.
+//   4. Set DetectionLookback to match your analytics rule frequency.
+//
+// AUTHOR: Nick Isakson
+// =============================================================================
+// TUNABLE THRESHOLDS
+// -----------------------------------------------------------------------------
+// Tier1Threshold: Number of Tier 1 (full device wipe/retire) actions that trigger
+//   Signal 1. Default 1 — in most environments, any wipe/retire is anomalous.
+//   Run the discovery query below to validate your baseline before adjusting.
+let Tier1Threshold = 1;
+// Tier2Threshold: Number of Tier 2 (device delete) actions within the velocity
+//   window that triggers Signal 1. Default 5 accounts for routine IT ops.
+//   Lower for smaller environments (<500 devices), raise for larger fleets.
+let Tier2Threshold = 5;
+// VelocityWindowMinutes: Sliding window for static velocity detection (Signal 1).
+//   Default 15m. Consider a companion rule at 60m with a higher threshold
+//   for slow-drip evasion detection.
+let VelocityWindowMinutes = 15m;
+// BaselineLookbackDays: Historical lookback for first-time operator detection
+//   (Signal 3) and for the ML time-series baseline (Signal 5).
+let BaselineLookbackDays = 14d;
+// UEBACorrelationWindow: Time window to correlate UEBA anomalies with
+//   destructive actions. Anomaly within 1 hour before or after the action.
+let UEBACorrelationWindow = 60m;
+// DetectionLookback: The rule's query period. Match to analytics rule frequency.
+let DetectionLookback = 30m;
+// MLSensitivity: Sensitivity for series_decompose_anomalies(). Controls how
+//   aggressively the algorithm flags deviations from baseline.
+//   Range: 0.0 (flag everything) to 5.0+ (only extreme outliers).
+//   Default 1.5 is moderate. Lower toward 1.0 for more sensitivity in small
+//   environments; raise toward 2.5 if results are noisy.
+let MLSensitivity = 1.5;
+// MLSeriesBinSize: Time bin for per-operator activity series.
+//   Default 1d = one data point per day per operator.
+let MLSeriesBinSize = 1d;
+// -----------------------------------------------------------------------------
+// OPERATION TIERS
+// -----------------------------------------------------------------------------
+// Tier 1: Full device destruction. Rare in most environments. ANY occurrence = alert.
+let Tier1_CriticalOps = dynamic([
+    "wipe ManagedDevice",
+    "Wipe ManagedDevice",
+    "retire ManagedDevice",
+    "Retire ManagedDevice"
+]);
+// Tier 2: Device delete. Legitimate IT activity typically exists; thresholds apply.
+let Tier2_HighOps = dynamic([
+    "Delete ManagedDevice"
+]);
+// Combined list for lookbacks
+let AllDestructiveOps = array_concat(Tier1_CriticalOps, Tier2_HighOps);
+// -----------------------------------------------------------------------------
+// SUPPRESSION LISTS
+// -----------------------------------------------------------------------------
+// SuppressedOperators: Human UPNs performing routine device lifecycle ops.
+//   Populate from discovery query results. Suppression ONLY applies to Tier 2.
+//   Tier 1 events are NEVER suppressed.
+//   IMPORTANT: Review this list quarterly — stale entries create blind spots.
+let SuppressedOperators = dynamic([
+    // "svc-intune-lifecycle@yourdomain.com"
+    // "your-it-admin@yourdomain.com"
+]);
+// SuppressedApplications: Automated Intune service applications to exclude.
+//   DuplicatePhoneRegistrationCleanup is a built-in Intune housekeeping app
+//   that removes stale device registrations. ActorType 5 = application identity.
+let SuppressedApplications = dynamic([
+    "DuplicatePhoneRegistrationCleanup"
+]);
+// =============================================================================
+// STEP 1: Gather all destructive Intune actions in the detection window
+// =============================================================================
+let CurrentEvents =
+    IntuneAuditLogs
+    | where TimeGenerated >= ago(DetectionLookback)
+    | where OperationName has_any (AllDestructiveOps)
+    // Parse Properties JSON for actor resolution and application identification
+    | extend PropertiesJson = todynamic(Properties)
+    | extend
+        ActorType = toint(PropertiesJson.Actor.ActorType),
+        ActorAppName = tostring(PropertiesJson.Actor.ApplicationName),
+        ActorUPN = tostring(PropertiesJson.Actor.UPN),
+        ActorName = tostring(PropertiesJson.Actor.Name),
+        ActorObjectId = tostring(PropertiesJson.Actor.ObjectId),
+        TargetInfo = tostring(PropertiesJson.TargetDisplayNames)
+    // Suppress known automated applications (ActorType 5 = application identity)
+    | where not(ActorAppName has_any (SuppressedApplications))
+    // Resolve operator identity with structured fallback chain:
+    //   1. Top-level Identity field if it contains a UPN (has @)
+    //   2. Actor.UPN from Properties JSON
+    //   3. Actor.Name from Properties JSON
+    //   4. ApplicationName if the actor is an application (ActorType 5)
+    //   5. Raw Identity field as last resort
+    | extend RawIdentity = tostring(Identity)
+    | extend Operator = case(
+        RawIdentity contains "@", RawIdentity,
+        isnotempty(ActorUPN), ActorUPN,
+        isnotempty(ActorName), ActorName,
+        ActorType == 5 and isnotempty(ActorAppName), strcat("APP:", ActorAppName),
+        RawIdentity
+    )
+    // Classify operation tier
+    | extend OperationTier = iff(OperationName has_any (Tier1_CriticalOps), "Tier1_Critical", "Tier2_High")
+    // Apply human operator suppression ONLY to Tier 2
+    | where not(OperationTier == "Tier2_High" and Operator has_any (SuppressedOperators))
+    | project
+        TimeGenerated,
+        Operator,
+        ActorType,
+        ActorAppName,
+        OperationName,
+        OperationTier,
+        TargetInfo,
+        CorrelationId,
+        ResultType;
+// =============================================================================
+// STEP 2: Historical operator baseline (Signals 3 and 5)
+// =============================================================================
+// 2a: Distinct historical operators for first-time detection (Signal 3)
+let HistoricalOperators =
+    IntuneAuditLogs
+    | where TimeGenerated between (ago(BaselineLookbackDays) .. ago(DetectionLookback))
+    | where OperationName has_any (AllDestructiveOps)
+    | extend PropertiesJson = todynamic(Properties)
+    | extend
+        ActorAppName = tostring(PropertiesJson.Actor.ApplicationName),
+        ActorUPN = tostring(PropertiesJson.Actor.UPN),
+        ActorName = tostring(PropertiesJson.Actor.Name),
+        ActorType = toint(PropertiesJson.Actor.ActorType)
+    | where not(ActorAppName has_any (SuppressedApplications))
+    | extend RawIdentity = tostring(Identity)
+    | extend Operator = case(
+        RawIdentity contains "@", RawIdentity,
+        isnotempty(ActorUPN), ActorUPN,
+        isnotempty(ActorName), ActorName,
+        ActorType == 5 and isnotempty(ActorAppName), strcat("APP:", ActorAppName),
+        RawIdentity
+    )
+    | distinct Operator;
+// 2b: Daily time-series per operator for ML anomaly detection (Signal 5)
+let OperatorTimeSeries =
+    IntuneAuditLogs
+    | where TimeGenerated >= ago(BaselineLookbackDays)
+    | where OperationName has_any (AllDestructiveOps)
+    | extend PropertiesJson = todynamic(Properties)
+    | extend
+        ActorAppName = tostring(PropertiesJson.Actor.ApplicationName),
+        ActorUPN = tostring(PropertiesJson.Actor.UPN),
+        ActorName = tostring(PropertiesJson.Actor.Name),
+        ActorType = toint(PropertiesJson.Actor.ActorType)
+    | where not(ActorAppName has_any (SuppressedApplications))
+    | extend RawIdentity = tostring(Identity)
+    | extend Operator = case(
+        RawIdentity contains "@", RawIdentity,
+        isnotempty(ActorUPN), ActorUPN,
+        isnotempty(ActorName), ActorName,
+        ActorType == 5 and isnotempty(ActorAppName), strcat("APP:", ActorAppName),
+        RawIdentity
+    )
+    // Build daily counts per operator over the baseline window
+    | make-series ActionCount = count() on TimeGenerated from ago(BaselineLookbackDays) to now() step MLSeriesBinSize by Operator
+    // Apply ML anomaly detection to each operator's time-series
+    // series_decompose_anomalies() decomposes into baseline, seasonal, trend,
+    // and residual components, then flags points where the residual exceeds
+    // the sensitivity threshold (1 = positive anomaly, -1 = negative, 0 = normal)
+    | extend (AnomalyFlags, AnomalyScore, AnomalyBaseline) = series_decompose_anomalies(ActionCount, MLSensitivity)
+    // Extract the most recent data point's anomaly status
+    | extend
+        LatestAnomalyFlag = toint(array_slice(AnomalyFlags, -1, -1)[0]),
+        LatestAnomalyScore = toreal(array_slice(AnomalyScore, -1, -1)[0]),
+        LatestCount = toint(array_slice(ActionCount, -1, -1)[0]),
+        LatestBaseline = toreal(array_slice(AnomalyBaseline, -1, -1)[0])
+    // Only keep operators where the latest period is a positive anomaly (spike)
+    | where LatestAnomalyFlag == 1
+    | project
+        Operator,
+        ML_IsAnomaly = true,
+        ML_AnomalyScore = LatestAnomalyScore,
+        ML_ActualCount = LatestCount,
+        ML_ExpectedBaseline = LatestBaseline,
+        ML_DeviationFactor = iff(LatestBaseline > 0, round(toreal(LatestCount) / LatestBaseline, 2), toreal(LatestCount));
+// =============================================================================
+// STEP 3: Build per-operator summary for the detection window
+// =============================================================================
+let OperatorSummary =
+    CurrentEvents
+    | summarize
+        TotalActions = count(),
+        Tier1Count = countif(OperationTier == "Tier1_Critical"),
+        Tier2Count = countif(OperationTier == "Tier2_High"),
+        FirstAction = min(TimeGenerated),
+        LastAction = max(TimeGenerated),
+        ActionTypes = make_set(OperationName),
+        OperationTiers = make_set(OperationTier),
+        TargetDevices = make_set(TargetInfo, 25),
+        ResultTypes = make_set(ResultType)
+        by Operator
+    | extend ActionSpanMinutes = datetime_diff('minute', LastAction, FirstAction)
+    // Signal 1: Static velocity threshold (hard floor)
+    | extend Signal_MassWipeVelocity = iff(
+        Tier1Count >= Tier1Threshold or Tier2Count >= Tier2Threshold,
+        true, false
+    )
+    // Signal 2: Bulk operations from single operator
+    | extend Signal_BulkWipeOperator = iff(TotalActions >= 2, true, false)
+    // Tier 1 presence flag for severity escalation
+    | extend HasTier1Event = iff(Tier1Count > 0, true, false);
+// =============================================================================
+// STEP 4: Enrich with Signal 3 — First-time operator detection
+// =============================================================================
+let EnrichedWithBaseline =
+    OperatorSummary
+    | extend Signal_FirstTimeOperator = iff(
+        Operator !in (HistoricalOperators), true, false
+    );
+// =============================================================================
+// STEP 5: Enrich with Signal 4 — UEBA anomaly correlation
+// =============================================================================
+// 5a: Sentinel Anomalies
+let RecentAnomalies =
+    Anomalies
+    | where TimeGenerated >= ago(DetectionLookback + UEBACorrelationWindow)
+    | where isnotempty(UserPrincipalName)
+    | project
+        AnomalyTime = TimeGenerated,
+        AnomalyOperator = UserPrincipalName,
+        AnomalyName = AnomalyTemplateName,
+        AnomalyScore = Score,
+        AnomalyDescription = Description;
+// 5b: BehaviorAnalytics
+let RecentBehaviorAnomalies =
+    BehaviorAnalytics
+    | where TimeGenerated >= ago(DetectionLookback + UEBACorrelationWindow)
+    | where InvestigationPriority > 0
+    | where isnotempty(UserPrincipalName)
+    | project
+        BehaviorTime = TimeGenerated,
+        BehaviorOperator = UserPrincipalName,
+        BehaviorActivityType = ActivityType,
+        BehaviorPriority = InvestigationPriority,
+        BehaviorInsights = ActivityInsights;
+// 5c: Correlate Anomalies table with operators
+let WithAnomalyCorrelation =
+    EnrichedWithBaseline
+    | join kind=leftouter (
+        RecentAnomalies
+    ) on $left.Operator == $right.AnomalyOperator
+    | extend AnomalyWithinWindow = iff(
+        isnotempty(AnomalyTime) and
+        AnomalyTime between ((FirstAction - UEBACorrelationWindow) .. (LastAction + UEBACorrelationWindow)),
+        true, false
+    )
+    | summarize
+        take_any(TotalActions),
+        take_any(Tier1Count),
+        take_any(Tier2Count),
+        take_any(FirstAction),
+        take_any(LastAction),
+        take_any(ActionTypes),
+        take_any(OperationTiers),
+        take_any(TargetDevices),
+        take_any(ActionSpanMinutes),
+        take_any(Signal_MassWipeVelocity),
+        take_any(Signal_BulkWipeOperator),
+        take_any(Signal_FirstTimeOperator),
+        take_any(HasTier1Event),
+        take_any(ResultTypes),
+        CorrelatedAnomalies = make_set_if(AnomalyName, AnomalyWithinWindow == true),
+        MaxAnomalyScore = max(iff(AnomalyWithinWindow == true, AnomalyScore, real(0)))
+        by Operator;
+// 5d: Correlate BehaviorAnalytics with operators
+let WithFullUEBA =
+    WithAnomalyCorrelation
+    | join kind=leftouter (
+        RecentBehaviorAnomalies
+    ) on $left.Operator == $right.BehaviorOperator
+    | extend BehaviorWithinWindow = iff(
+        isnotempty(BehaviorTime) and
+        BehaviorTime between ((FirstAction - UEBACorrelationWindow) .. (LastAction + UEBACorrelationWindow)),
+        true, false
+    )
+    | summarize
+        take_any(TotalActions),
+        take_any(Tier1Count),
+        take_any(Tier2Count),
+        take_any(FirstAction),
+        take_any(LastAction),
+        take_any(ActionTypes),
+        take_any(OperationTiers),
+        take_any(TargetDevices),
+        take_any(ActionSpanMinutes),
+        take_any(Signal_MassWipeVelocity),
+        take_any(Signal_BulkWipeOperator),
+        take_any(Signal_FirstTimeOperator),
+        take_any(HasTier1Event),
+        take_any(ResultTypes),
+        take_any(CorrelatedAnomalies),
+        take_any(MaxAnomalyScore),
+        CorrelatedBehaviors = make_set_if(BehaviorActivityType, BehaviorWithinWindow == true),
+        MaxBehaviorPriority = max(iff(BehaviorWithinWindow == true, BehaviorPriority, 0))
+        by Operator
+    | extend Signal_UEBACorrelation = iff(
+        array_length(CorrelatedAnomalies) > 0 or array_length(CorrelatedBehaviors) > 0,
+        true, false
+    );
+// =============================================================================
+// STEP 6: Enrich with Signal 5 — ML anomaly detection
+// =============================================================================
+let WithMLAnomaly =
+    WithFullUEBA
+    | join kind=leftouter (
+        OperatorTimeSeries
+    ) on Operator
+    | extend
+        Signal_MLAnomaly = iff(ML_IsAnomaly == true, true, false),
+        ML_AnomalyScore = coalesce(ML_AnomalyScore, real(0)),
+        ML_ActualCount = coalesce(ML_ActualCount, 0),
+        ML_ExpectedBaseline = coalesce(ML_ExpectedBaseline, real(0)),
+        ML_DeviationFactor = coalesce(ML_DeviationFactor, real(0));
+// =============================================================================
+// STEP 7: Enrich with IdentityInfo for role context
+// =============================================================================
+let WithRoleContext =
+    WithMLAnomaly
+    | join kind=leftouter (
+        IdentityInfo
+        | where TimeGenerated >= ago(14d)
+        | summarize arg_max(TimeGenerated, *) by AccountUPN
+        | project
+            RoleOperator = AccountUPN,
+            AssignedRoles = AssignedRoles,
+            Department = Department,
+            JobTitle = JobTitle,
+            IsAccountEnabled = IsAccountEnabled
+    ) on $left.Operator == $right.RoleOperator;
+// =============================================================================
+// STEP 8: Final scoring, severity classification, and output
+// =============================================================================
+WithRoleContext
+| extend
+    // Count how many signals fired
+    SignalCount = toint(Signal_MassWipeVelocity)
+               + toint(Signal_BulkWipeOperator)
+               + toint(Signal_FirstTimeOperator)
+               + toint(Signal_UEBACorrelation)
+               + toint(Signal_MLAnomaly),
+    // Human-readable signal list
+    DetectionSignals = strcat_array(
+        array_concat(
+            iff(Signal_MassWipeVelocity == true, dynamic(["MASS_WIPE_VELOCITY"]), dynamic([])),
+            iff(Signal_BulkWipeOperator == true, dynamic(["BULK_WIPE_OPERATOR"]), dynamic([])),
+            iff(Signal_FirstTimeOperator == true, dynamic(["FIRST_TIME_OPERATOR"]), dynamic([])),
+            iff(Signal_UEBACorrelation == true, dynamic(["UEBA_ANOMALY_CORRELATED"]), dynamic([])),
+            iff(Signal_MLAnomaly == true, dynamic(["ML_BEHAVIORAL_ANOMALY"]), dynamic([]))
+        ), ", "
+    )
+// Severity logic:
+//   ANY Tier 1 event = Critical (wipe/retire is rare in most environments)
+//   4-5 signals = Critical (overwhelming evidence of compromise)
+//   3 signals = High
+//   2 signals = Medium
+//   1 signal = Low (informational — single weak signal)
+| extend AlertSeverity = case(
+    HasTier1Event == true, "Critical",
+    SignalCount >= 4, "Critical",
+    SignalCount == 3, "High",
+    SignalCount == 2, "Medium",
+    SignalCount == 1, "Low",
+    "Informational"
+)
+// Only surface results where at least one signal fired
+| where SignalCount >= 1
+| project
+    FirstAction,
+    LastAction,
+    Operator,
+    TotalActions,
+    Tier1Count,
+    Tier2Count,
+    ActionSpanMinutes,
+    ActionTypes,
+    AlertSeverity,
+    HasTier1Event,
+    SignalCount,
+    DetectionSignals,
+    // Individual signal flags
+    Signal_MassWipeVelocity,
+    Signal_BulkWipeOperator,
+    Signal_FirstTimeOperator,
+    Signal_UEBACorrelation,
+    Signal_MLAnomaly,
+    // UEBA context
+    CorrelatedAnomalies,
+    MaxAnomalyScore,
+    CorrelatedBehaviors,
+    MaxBehaviorPriority,
+    // ML context
+    ML_AnomalyScore,
+    ML_ActualCount,
+    ML_ExpectedBaseline,
+    ML_DeviationFactor,
+    // Identity context
+    AssignedRoles,
+    Department,
+    JobTitle,
+    IsAccountEnabled,
+    // Action details
+    TargetDevices,
+    ResultTypes
+| order by AlertSeverity asc, SignalCount desc, TotalActions desc
+// =============================================================================
+// DISCOVERY QUERY (Run this BEFORE deploying the detection)
+// Purpose: Map your environment's baseline wipe/retire/delete activity to
+//          inform suppression lists and threshold tuning.
+// =============================================================================
+// let DestructiveOperations = dynamic([
+//     "wipe ManagedDevice", "Wipe ManagedDevice",
+//     "retire ManagedDevice", "Retire ManagedDevice",
+//     "Delete ManagedDevice"
+// ]);
+// IntuneAuditLogs
+// | where TimeGenerated >= ago(30d)
+// | where OperationName has_any (DestructiveOperations)
+// | extend PropertiesJson = todynamic(Properties)
+// | extend
+//     ActorType = toint(PropertiesJson.Actor.ActorType),
+//     ActorAppName = tostring(PropertiesJson.Actor.ApplicationName)
+// | extend RawIdentity = tostring(Identity)
+// | extend Operator = case(
+//     RawIdentity contains "@", RawIdentity,
+//     isnotempty(tostring(PropertiesJson.Actor.UPN)), tostring(PropertiesJson.Actor.UPN),
+//     isnotempty(tostring(PropertiesJson.Actor.Name)), tostring(PropertiesJson.Actor.Name),
+//     ActorType == 5 and isnotempty(ActorAppName), strcat("APP:", ActorAppName),
+//     RawIdentity
+// )
+// | summarize
+//     TotalActions = count(),
+//     WipeCount = countif(OperationName has "wipe"),
+//     RetireCount = countif(OperationName has "retire"),
+//     DeleteCount = countif(OperationName has "Delete"),
+//     FirstSeen = min(TimeGenerated),
+//     LastSeen = max(TimeGenerated),
+//     ActionTypes = make_set(OperationName)
+//     by Operator, ActorType, ActorAppName
+// | order by TotalActions desc

@@ -18,6 +18,7 @@ Queries are organized by MITRE ATT&CK tactic. Each `.kql` file contains the full
 ├── credential-access/
 ├── command-and-control/
 ├── exfiltration/
+├── impact/
 └── security-operations/
 ```
 
@@ -63,6 +64,12 @@ Queries are organized by MITRE ATT&CK tactic. Each `.kql` file contains the full
 |:------|:----------|:------------|
 | [CATO Networks Blocked URL Access](command-and-control/cato-networks-blocked-url-access.kql) | T1189, T1071.001 | Identifies blocked URL access attempts from CATO Networks security policies with configurable device and URL filtering. |
 | [ChatGPT Stealer C2 Domains](command-and-control/chatgpt-stealer-c2-domains.kql) | T1071.001, T1567 | Detects network connections to known C2 domains used by the ChatGPT Stealer campaign for AI session token exfiltration. |
+
+### Impact (TA0040)
+
+| Query | Technique | Description |
+|:------|:----------|:------------|
+| [Intune Mass Device Wipe / Destructive Actions](impact/intune-mass-device-wipe-destructive-actions.kql) | T1485, T1561, T1561.001 | Multi-signal detection for mass device wipe/retire/delete via Microsoft Intune, inspired by the Stryker/Handala attack. Combines static velocity thresholds, bulk operator detection, first-time operator baselining, UEBA anomaly correlation, and ML behavioral anomaly detection with tiered severity escalation. |
 
 ### Exfiltration (TA0010)
 
