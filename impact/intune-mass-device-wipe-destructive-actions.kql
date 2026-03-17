@@ -371,9 +371,9 @@ let WithRoleContext =
     | join kind=leftouter (
         IdentityInfo
         | where TimeGenerated >= ago(14d)
-        | summarize arg_max(TimeGenerated, *) by AccountUPN
+        | summarize arg_max(TimeGenerated, *) by AccountUpn
         | project
-            RoleOperator = AccountUPN,
+            RoleOperator = AccountUpn,
             AssignedRoles = AssignedRoles,
             Department = Department,
             JobTitle = JobTitle,
