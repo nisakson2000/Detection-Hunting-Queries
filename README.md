@@ -32,6 +32,7 @@ Queries are organized by MITRE ATT&CK tactic. Each `.kql` file contains the full
 |:------|:----------|:------------|
 | [Stolen Device Logon Detection](initial-access/stolen-device-logon-detection.kql) | T1078 | Detects successful logon activity on devices reported as stolen or missing, enriched with ISP IP data from Azure AD sign-in logs. |
 | [Phishing Investigation & Impact Analysis](initial-access/phishing-investigation-impact-analysis.kql) | T1566.001, T1566.002, T1204 | Comprehensive phishing triage query correlating email delivery, URL clicks, attachments, endpoint file activity, reply behavior, and post-delivery ZAP actions into a single view per recipient. |
+| [Cato Anti Malware — Confirmed Malware Detection](initial-access/cato-anti-malware-detection.kql) | T1566.001, T1105 | Alerts on confirmed malware verdicts from Cato's inline Anti Malware engine, covering both blocked and allowed files with severity escalation when malware passes through unblocked. |
 
 ### Discovery (TA0007)
 
@@ -85,6 +86,7 @@ Queries are organized by MITRE ATT&CK tactic. Each `.kql` file contains the full
 | [MSSP Alert Tracking & Deduplication](security-operations/mssp-alert-tracking-deduplication.kql) | Configurable query to track and deduplicate alert emails from an MSSP, using session logic to group email bursts and extract case numbers from portal URLs. |
 | [Imperva WAF Blocked Requests by Organization](security-operations/imperva-waf-blocked-requests-by-org.kql) | Multi-layer aggregation of Imperva WAF blocked requests, enriched with ASN/organization data, rolling up from pattern → attack type → IP → organization for threat analysis. |
 | [Email Delivery Telemetry & Threat Exposure](security-operations/email-delivery-telemetry-threat-exposure.kql) | Identifies accounts with the highest email volume and threat exposure, including a key risk metric for threats that bypassed filtering and reached user inboxes. |
+| [Sporadic Device Activity Validation](security-operations/sporadic-device-activity-validation.kql) | Hunting query to validate whether a device flagged by a decommissioned-asset detection exhibits sporadic legitimate use. Builds a daily timeline across logon, process, and network telemetry over a configurable lookback window. |
 
 ---
 

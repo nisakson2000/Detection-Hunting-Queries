@@ -1,0 +1,77 @@
+// =============================================================
+// HUNT: Sporadic Device Activity Validation
+// =============================================================
+// PURPOSE: Validates whether a device flagged by a "Decommissioned
+// Asset Active" (or similar stale-device) detection exhibits a
+// pattern of sporadic, legitimate use rather than unauthorized
+// activity. Takes the alert's most recent activity timestamp and
+// looks back a configurable window to find prior activity days.
+//
+// USE CASE: Low-frequency-use endpoints (executive laptops, board
+// member devices, break-glass machines, conference room assets)
+// that sit idle for weeks then generate bursts of telemetry when
+// used for meetings or periodic access. These devices routinely
+// trip decommissioned-asset detections and need a fast way to
+// confirm the historical usage pattern before closing as benign.
+//
+// HOW TO READ THE OUTPUT: Each row is a calendar day within the
+// lookback window. Columns show which telemetry types fired that
+// day and the event counts. Gaps between active days confirm the
+// sporadic use pattern; continuous daily activity suggests the
+// device is not actually dormant and the detection logic or asset
+// inventory may need review.
+// =============================================================
+// TUNABLE THRESHOLDS
+let TargetDevice = "DEVICE-NAME-HERE";  // DeviceName from the alert entity
+let AlertActivityTime = datetime(2026-01-01T00:00:00Z);  // StartTime from the alert (UTC)
+let LookbackDays = 90d;  // How far back to search for prior activity
+let LookbackStart = AlertActivityTime - LookbackDays;
+// =============================================================
+// Pull logon activity — indicates user-driven sessions
+let LogonActivity = DeviceLogonEvents
+| where TimeGenerated between (LookbackStart .. AlertActivityTime)
+| where DeviceName has TargetDevice
+| summarize
+    LogonEvents = count(),
+    LogonTypes = make_set(LogonType),
+    AccountsUsed = make_set(AccountName)
+    by Day = bin(TimeGenerated, 1d);
+// Pull process activity — indicates actual execution on the box
+let ProcessActivity = DeviceProcessEvents
+| where TimeGenerated between (LookbackStart .. AlertActivityTime)
+| where DeviceName has TargetDevice
+| summarize
+    ProcessEvents = count(),
+    UniqueProcesses = dcount(FileName),
+    SampleProcesses = make_set(FileName, 10)
+    by Day = bin(TimeGenerated, 1d);
+// Pull network activity — indicates the device was communicating
+let NetworkActivity = DeviceNetworkEvents
+| where TimeGenerated between (LookbackStart .. AlertActivityTime)
+| where DeviceName has TargetDevice
+| summarize
+    NetworkEvents = count(),
+    UniqueRemoteIPs = dcount(RemoteIP),
+    UniqueRemoteUrls = dcount(RemoteUrl)
+    by Day = bin(TimeGenerated, 1d);
+// =============================================================
+// Combine all three telemetry sources into a single daily timeline
+// Full outer joins ensure days with only one telemetry type still appear
+LogonActivity
+| join kind=fullouter ProcessActivity on Day
+| join kind=fullouter NetworkActivity on $left.Day1 == $right.Day
+// Coalesce the Day columns since fullouter can null either side
+| extend ActivityDate = coalesce(Day, Day1, Day2)
+| project
+    ActivityDate,
+    LogonEvents = coalesce(LogonEvents, 0),
+    LogonTypes = coalesce(LogonTypes, dynamic([])),
+    AccountsUsed = coalesce(AccountsUsed, dynamic([])),
+    ProcessEvents = coalesce(ProcessEvents, 0),
+    UniqueProcesses = coalesce(UniqueProcesses, 0),
+    SampleProcesses = coalesce(SampleProcesses, dynamic([])),
+    NetworkEvents = coalesce(NetworkEvents, 0),
+    UniqueRemoteIPs = coalesce(UniqueRemoteIPs, 0),
+    UniqueRemoteUrls = coalesce(UniqueRemoteUrls, 0),
+    TotalEvents = coalesce(LogonEvents, 0) + coalesce(ProcessEvents, 0) + coalesce(NetworkEvents, 0)
+| order by ActivityDate asc
