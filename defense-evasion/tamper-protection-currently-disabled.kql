@@ -1,0 +1,23 @@
+// Name: Tamper Protection Currently Disabled — Fleet Posture Hunt
+// Author: Nicholas Isakson
+// Date: 2026-07-13
+// Description: Hunting query that reports the current Tamper Protection state per device by taking the most recent registry write and surfacing only devices where Tamper Protection is presently OFF (value 0). Includes how many hours the protection has been disabled and the process/account that last changed it, so analysts can prioritize long-exposed endpoints and confirm whether the change was expected.
+// References: https://learn.microsoft.com/en-us/defender-endpoint/prevent-changes-to-security-settings-with-tamper-protection
+// Platform: Defender XDR Advanced Hunting (Timestamp). For Microsoft Sentinel, replace Timestamp with TimeGenerated.
+// Data Sources: DeviceRegistryEvents
+// False Positive Sensitivity: Low — reflects current posture rather than an event; validate expected exclusions before alerting.
+// Tags: T1562.001
+DeviceRegistryEvents
+| where RegistryKey has @"\Windows Defender\Features"
+| where RegistryValueName == "TamperProtection"
+// Collapse to the latest known state per device.
+| summarize arg_max(Timestamp, RegistryValueData, PreviousRegistryValueData,
+                    InitiatingProcessFileName, InitiatingProcessAccountName)
+        by DeviceName
+// Keep only devices whose most recent state is OFF.
+| where RegistryValueData == "0"
+| extend HoursDisabled = datetime_diff("hour", now(), Timestamp) * -1
+| project DeviceName, LastChange=Timestamp, CurrentValue=RegistryValueData,
+          PreviousValue=PreviousRegistryValueData, HoursDisabled,
+          InitiatingProcessFileName, InitiatingProcessAccountName
+| order by LastChange asc

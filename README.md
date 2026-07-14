@@ -5,8 +5,8 @@
     <strong>Microsoft Sentinel</strong> and <strong>Defender XDR</strong>, organized by <a href="https://attack.mitre.org/">MITRE ATT&CK</a> tactics.
   </p>
   <p align="center">
-    <img src="https://img.shields.io/badge/queries-17-blue?style=flat-square" alt="Total Queries">
-    <img src="https://img.shields.io/badge/MITRE%20tactics-8-red?style=flat-square" alt="MITRE Tactics">
+    <img src="https://img.shields.io/badge/queries-19-blue?style=flat-square" alt="Total Queries">
+    <img src="https://img.shields.io/badge/MITRE%20tactics-9-red?style=flat-square" alt="MITRE Tactics">
     <img src="https://img.shields.io/badge/language-KQL-purple?style=flat-square" alt="Language">
     <img src="https://img.shields.io/badge/license-open-green?style=flat-square" alt="License">
   </p>
@@ -22,7 +22,7 @@
 
 | | |
 |:--|:--|
-| **Detections** | 13 analytics rules covering initial access through impact |
+| **Detections** | 15 analytics rules covering initial access through impact |
 | **Hunting Queries** | 4 security operations queries for triage, enrichment, and validation |
 | **Data Sources** | `DeviceLogonEvents`, `DeviceProcessEvents`, `DeviceNetworkEvents`, `CommonSecurityLog`, `EmailEvents`, `IdentityLogonEvents`, `IntuneAuditLogs`, and more |
 | **Platforms** | Microsoft Sentinel (primary) · Defender XDR Advanced Hunting |
@@ -37,6 +37,7 @@ Detection-Hunting-Queries/
 ├── initial-access/              # TA0001 — 3 queries
 ├── execution/                   # TA0002 — 1 query
 ├── persistence/                 # TA0003 — 2 queries
+├── defense-evasion/             # TA0005 — 2 queries
 ├── credential-access/           # TA0006 — 1 query
 ├── discovery/                   # TA0007 — 1 query
 ├── command-and-control/         # TA0011 — 2 queries
@@ -73,6 +74,13 @@ Tactics are ordered to follow the [ATT&CK kill chain](https://attack.mitre.org/)
 |:------|:----------|:------------|
 | [Sensitive Group Membership Changes](persistence/sensitive-group-membership-changes.kql) | T1098 | Detects members added or removed from sensitive Active Directory groups (Domain Admins, Enterprise Admins, etc.). |
 | [ChatGPT Stealer Extension Installation](persistence/chatgpt-stealer-extension-installation.kql) | T1176 | Detects installation of known malicious browser extension IDs associated with the ChatGPT Stealer campaign targeting AI session tokens. |
+
+### Defense Evasion (TA0005)
+
+| Query | Technique | Description |
+|:------|:----------|:------------|
+| [Tamper Protection Disabled — Troubleshooting Mode Correlation](defense-evasion/tamper-protection-disabled-troubleshooting-correlation.kql) | T1562.001 | Detects Defender Tamper Protection being turned off (5 → 0/4) and correlates each change against Antivirus Troubleshooting Mode windows, auto-classifying benign in-portal edits versus suspicious manual/local changes. |
+| [Tamper Protection Currently Disabled — Fleet Posture Hunt](defense-evasion/tamper-protection-currently-disabled.kql) | T1562.001 | Hunting query surfacing devices where Tamper Protection is presently OFF, showing hours disabled and the process/account that last changed it to prioritize long-exposed endpoints. |
 
 ### Credential Access (TA0006)
 

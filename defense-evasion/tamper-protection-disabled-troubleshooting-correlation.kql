@@ -1,0 +1,36 @@
+// Name: Tamper Protection Disabled — Troubleshooting Mode Correlation
+// Author: Nicholas Isakson
+// Date: 2026-07-13
+// Description: Detects Microsoft Defender Tamper Protection being turned off (registry value 5 -> 0/4) and correlates each change against Defender Antivirus Troubleshooting Mode windows. Changes made inside a valid Troubleshooting Mode window are labeled benign (the acting admin is recorded in the portal Audit log); changes made by a non-system user outside that window are surfaced as suspicious manual/local edits. Routine policy/service re-writes are dropped to reduce noise.
+// References: https://learn.microsoft.com/en-us/defender-endpoint/prevent-changes-to-security-settings-with-tamper-protection
+// Platform: Defender XDR Advanced Hunting (Timestamp). For Microsoft Sentinel, replace Timestamp with TimeGenerated.
+// Data Sources: DeviceRegistryEvents, DeviceEvents (AntivirusTroubleshootModeEvent)
+// False Positive Sensitivity: Low — Troubleshooting Mode edits are auto-classified as benign; tune the correlation window if your environment uses longer sessions.
+// Tags: T1562.001
+let TSMode =
+    DeviceEvents
+    | where ActionType == "AntivirusTroubleshootModeEvent"
+    | extend F = parse_json(AdditionalFields)
+    | where tostring(F.TroubleshootingState) == "On"
+    | project DeviceId, TSStart = Timestamp, TSExpiry = todatetime(F.TroubleshootingStateExpiry);
+DeviceRegistryEvents
+| where RegistryKey has @"\Windows Defender\Features"
+| where RegistryValueName == "TamperProtection"
+| where RegistryValueData in ("0","4") and PreviousRegistryValueData == "5"
+| join kind=leftouter TSMode on DeviceId
+// Allow a 30m lead-in before the recorded TS start and a 5m grace after expiry to absorb clock skew.
+| extend WithinTSWindow = isnotempty(TSStart) and Timestamp between (TSStart - 30m .. TSExpiry + 5m)
+| extend Method = case(
+        WithinTSWindow,
+            "Troubleshooting Mode (benign - actor in portal Audit log)",
+        isnotempty(InitiatingProcessAccountName) and InitiatingProcessAccountName != "system",
+            "Manual/local edit (SUSPICIOUS - actor captured below)",
+        "Other/policy re-write")
+// keep only Troubleshooting Mode + genuine manual edits; drop routine policy/service noise
+| where Method != "Other/policy re-write"
+| project Timestamp, DeviceName, Method, WithinTSWindow,
+          TamperProtection = strcat(PreviousRegistryValueData, " -> ", RegistryValueData),
+          AccountDisplayName = InitiatingProcessAccountName,
+          InitiatingProcessAccountUpn,
+          TSStart, TSExpiry
+| order by Timestamp desc
